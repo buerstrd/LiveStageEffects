@@ -1,0 +1,148 @@
+@import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@300;400;500;600;700&display=swap');
+
+:root {
+  /* 冷灰色 (Cool Grey) Theme Design Tokens */
+  
+  /* Surface & Background (Cool Grey & Slate Foundation) */
+  --md-sys-color-background: #181a1f;
+  --md-sys-color-on-background: #e8edf2;
+  --md-sys-color-surface: #1c1f26;
+  --md-sys-color-on-surface: #e8edf2;
+  --md-sys-color-surface-dim: #16181d;
+  --md-sys-color-surface-bright: #383d47;
+  
+  /* Surface Containers (Chrome Cool Grey Tonal Elevations) */
+  --md-sys-color-surface-container-lowest: #131518;
+  --md-sys-color-surface-container-low: #1c2027;
+  --md-sys-color-surface-container: #22262e;
+  --md-sys-color-surface-container-high: #282c35;
+  --md-sys-color-surface-container-highest: #323843;
+  
+  --md-sys-color-surface-variant: #3a404c;
+  --md-sys-color-on-surface-variant: #aab3bf;
+  --md-sys-color-outline: #727b8c;
+  --md-sys-color-outline-variant: #3a404c;
+  
+  /* Primary & Accent Tones (Chrome Iconic Cool Blue / Slate Light Blue) */
+  --md-sys-color-primary: #8ab4f8;
+  --md-sys-color-on-primary: #042a59;
+  --md-sys-color-primary-container: #1a3b68;
+  --md-sys-color-on-primary-container: #d3e3fd;
+  
+  --md-sys-color-secondary: #b9c3d4;
+  --md-sys-color-on-secondary: #243040;
+  --md-sys-color-secondary-container: #3a4658;
+  --md-sys-color-on-secondary-container: #d8e2f3;
+  
+  --md-sys-color-tertiary: #8c92ac; /* Standard Cool Grey */
+  --md-sys-color-on-tertiary: #181c2b;
+  --md-sys-color-tertiary-container: #2b3244;
+  --md-sys-color-on-tertiary-container: #dee1ec;
+  
+  /* Shape / Corner Radius */
+  --md-sys-shape-corner-none: 0px;
+  --md-sys-shape-corner-extra-small: 4px;
+  --md-sys-shape-corner-small: 8px;
+  --md-sys-shape-corner-medium: 12px;
+  --md-sys-shape-corner-large: 16px;
+  --md-sys-shape-corner-extra-large: 28px;
+  --md-sys-shape-corner-full: 9999px;
+  
+  /* Typography */
+  --md-sys-typescale-font-family: 'Google Sans', sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+  background-color: var(--md-sys-color-background);
+  background-image: radial-gradient(rgba(170, 179, 191, 0.22) 1.2px, transparent 1.2px);
+  background-size: 24px 24px;
+  color: var(--md-sys-color-on-background);
+  font-family: 'Google Sans', sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#__nuxt {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  font-family: 'Google Sans', sans-serif;
+}
+
+/* 隐藏背景网格 */
+body.no-grid {
+  background-image: none !important;
+}
+
+/* 禁用过渡动效 */
+.no-transitions * {
+  transition: none !important;
+  animation-duration: 0.001ms !important;
+}
+
+/* 开发设置：关闭所有界面动画效果 */
+.animations-disabled,
+.animations-disabled *,
+.animations-disabled *::before,
+.animations-disabled *::after {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+}
+
+/* 统一所有控件、输入框与代码元素全局采用 Google Sans */
+button,
+[role="button"],
+input,
+select,
+textarea,
+pre,
+code,
+kbd,
+samp,
+.font-mono {
+  font-family: 'Google Sans', sans-serif !important;
+}
+
+button,
+[role="button"] {
+  position: relative;
+  overflow: hidden;
+}
+
+/* Material Design 3 全局水波纹涟漪动效 */
+.md3-ripple {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+  background-color: currentColor;
+  opacity: 0.22;
+  transform: scale(0);
+  animation: md3-ripple-animation 0.6s cubic-bezier(0.2, 0, 0, 1) forwards;
+  z-index: 1;
+}
+
+@keyframes md3-ripple-animation {
+  0% {
+    transform: scale(0);
+    opacity: 0.26;
+  }
+  100% {
+    transform: scale(2.5);
+    opacity: 0;
+  }
+}
