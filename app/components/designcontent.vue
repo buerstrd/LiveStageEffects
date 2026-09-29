@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { presetsManager, type PresetPoint, type PresetColorPoint } from '~/composables/presetsmanager'
-import { sampleCurveBrightness, sampleCurveColor } from '~/composables/devicesmanager'
+import { useRealtimeBpm } from '~/composables/bpmanalyzer'
+import { presetsManager } from '~/composables/presetsmanager'
+import { renderStatusManager } from '~/composables/renderstatusmanager'
 import {
   eventsManager,
-  formatTriggerTime,
+  formatTimelineTime,
+  getEventPresets,
   getEventPresetPlaybacks,
   getEventPresetTriggers,
+  getEventEndTimeSeconds,
   getEventRangeDurationMs,
   isValidTriggerTime,
   normalizeEventTimelineTrackCount,
@@ -15,34 +18,23 @@ import {
   type EventPresetPlayback
 } from '~/composables/eventsmanager'
 import { formatVideoTime, videoManager } from '~/composables/videomanager'
-import { settingsManager } from '~/composables/settingsmanager'
 import { windowsManager } from '~/composables/windowsmanager'
+import type { PresetItem } from '~/utils/presetcurve'
 
-const {
-  activePreset,
-  presets,
-  selectedPresetId,
-  updatePresetEffect,
-  isPlaying,
-  isPlaybackPaused,
-  playProgress,
-  playTriggerTime,
-  playSeekProgress,
-  playSeekVersion,
-  togglePlay
-} = presetsManager()
+const { presetDragPointerOffsetX } = presetsManager()
 const {
   events,
   selectedEventId,
   playingEventId,
   playingEventTriggerId,
-  eventPlayProgress,
   isEventRecording,
   selectEvent,
   addEventPresetTrigger,
-  updateEventPresetTriggerTime,
-  updateEventPresetTriggerTrack,
-  removeEventPresetTrigger
+  addEventPresetTriggers,
+  importPresetToEvent,
+  updateEventPresetTriggerRange,
+  updateEventPresetTriggers,
+  removeEventPresetTriggers
 } = eventsManager()
 const {
   videoSrc,
@@ -50,75 +42,49 @@ const {
   duration: videoDuration,
   seekVideo: seekVideoTo
 } = videoManager()
-const { disableAnimations } = settingsManager()
 const {
-  designViewMode,
+  beatGridAnchor,
+  beatGridPeriod
+} = useRealtimeBpm()
+const {
   timelineFollowEnabled,
   setTimelineFollowEnabled
 } = windowsManager()
+const {
+  beginRenderTask,
+  updateRenderTask,
+  finishRenderTask,
+  cancelRenderTask
+} = renderStatusManager()
 
-// 预设效果预览颜色方块 DOM 引用
-const previewBoxRef = ref<HTMLDivElement | null>(null)
-const designViewRef = ref<HTMLElement | null>(null)
 const timelineEditorRef = ref<HTMLElement | null>(null)
 const timelineThumbnailStripRef = ref<HTMLElement | null>(null)
-
-// 预览播放填充态进入与退出渐变透明度 (0.0 ~ 1.0)
-const fillAlpha = ref(0)
-
-// 历史消退扫描填充列表 (用于重复按下发送/预览时，让前一个填充带平滑渐变动画消失)
-interface FadingFill {
-  progress: number
-  alpha: number
-}
-const fadingFills = ref<FadingFill[]>([])
-
-// 当前主颜色
-const currentColor = computed(() => {
-  return activePreset.value?.effect?.color || '#ffffff'
-})
-
-const normalizeColorPoint = (
-  point: Partial<PresetColorPoint>,
-  fallbackColor: string
-): PresetColorPoint => ({
-  x: typeof point.x === 'number' && Number.isFinite(point.x)
-    ? Math.max(0, Math.min(1, point.x))
-    : 0,
-  y: typeof point.y === 'number' && Number.isFinite(point.y)
-    ? Math.max(0, Math.min(1, point.y))
-    : 1,
-  color: typeof point.color === 'string' && point.color.trim()
-    ? point.color
-    : fallbackColor
-})
-
-// 当前重复次数 (>= 1)
-const currentRepeat = computed(() => {
-  return Math.max(1, activePreset.value?.effect?.repeat ?? 1)
-})
-
-// 当前时长 (ms, 默认 500ms)
-const currentDuration = computed(() => {
-  return activePreset.value?.effect?.duration ?? 500
-})
 
 // -------------------------------------------------------------
 // 事件时间线
 // -------------------------------------------------------------
 const TIMELINE_MIN_DURATION = 0.1
+const TIMELINE_MAX_ZOOM = 20
 const TIMELINE_TRACK_RECOMMENDED_HEIGHT = 76
 const TIMELINE_VERTICAL_ZOOM_MIN = 0.75
 const TIMELINE_VERTICAL_ZOOM_MAX = 2.5
 const TIMELINE_VERTICAL_ZOOM_STEP = 0.25
 const TIMELINE_WAVEFORM_LANE_HEIGHT = 48
+const TIMELINE_BEAT_MARKER_LIMIT = 2000
+const TIMELINE_FILL_MAX_PREVIEWS = 200
+const TIMELINE_MARQUEE_THRESHOLD = 3
+const TIMELINE_BPM_SNAP_RADIUS_PX = 26
+const TIMELINE_BPM_SNAP_STRENGTH = 0.85
 const PRESET_DRAG_MIME = 'application/x-livestage-preset'
 const PRESET_DRAG_META_MIME = 'application/x-livestage-preset-meta'
-const PRESET_DRAG_TEXT_PREFIX = 'livestage-preset:'
 const TIMELINE_TRIGGER_DRAG_MIME = 'application/x-livestage-timeline-trigger'
-const TIMELINE_CLIP_DRAG_ANIMATION_ID = 'timeline-clip-drag'
 
-type TimelineInteractionMode = 'pan' | 'playhead'
+type TimelineInteractionMode =
+  | 'pan'
+  | 'marquee'
+  | 'playhead'
+  | 'preset-resize-start'
+  | 'preset-resize-end'
 
 interface PresetDragRect {
   left: number
@@ -129,6 +95,7 @@ interface PresetDragRect {
 
 interface PresetDragPayload {
   id: number
+  sourceEventId?: number
   rect?: PresetDragRect
   grabOffset?: {
     x: number
@@ -150,14 +117,102 @@ interface TimelinePresetItem {
   track: number
 }
 
+interface TimelineClipboardItem {
+  sourceEventId: number
+  sourcePresetId: number
+  preset: PresetItem
+  relativeStartSeconds: number
+  durationMs: number
+  track: number
+}
+
+interface TimelineClipboardPayload {
+  items: TimelineClipboardItem[]
+}
+
+interface TimelineContextMenuState {
+  visible: boolean
+  x: number
+  y: number
+  timeSeconds: number
+  track: number
+}
+
+interface TimelinePointerPosition {
+  timeSeconds: number
+  track: number
+}
+
+interface TimelineFillPreview {
+  key: string
+  startTime: number
+  durationSeconds: number
+  color: string
+  track: number
+}
+
+interface TimelineFillDragState {
+  pointerId: number
+  handle: HTMLElement
+  item: TimelinePresetItem
+  eventStartTime: number
+  copyStartTime: number
+  copyDurationSeconds: number
+  lastClientX: number
+  direction: 'copy' | 'remove' | null
+  previewCount: number
+  removePreviewTriggerIds: number[]
+}
+
+interface TimelineClipDragGroupItem {
+  triggerId: number
+  startTime: number
+  track: number
+  rect: DOMRect | null
+  dropRect: DOMRect | null
+  element: HTMLElement | null
+}
+
+interface TimelineClipDragGroup {
+  eventId: number
+  primaryTriggerId: number
+  startClientX: number
+  startClientY: number
+  items: TimelineClipDragGroupItem[]
+}
+
 interface TimelineInteractionState {
   mode: TimelineInteractionMode
   pointerId: number
   startClientX: number
+  startClientY?: number
   captureElement?: HTMLElement
   initialScrollLeft?: number
+  initialScrollTop?: number
+  panButton?: 0 | 1
   allowClickSeek?: boolean
+  initialSelectedTriggerIds?: number[]
+  additive?: boolean
+  eventId?: number
+  triggerId?: number
+  initialClipStart?: number
+  initialClipDuration?: number
+  pendingClipStart?: number
+  pendingClipDuration?: number
   moved: boolean
+}
+
+interface TimelineMarqueeRect {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+interface TimelinePresetResizePreview {
+  triggerId: number
+  startTime: number
+  durationSeconds: number
 }
 
 interface TimelineScrollbarDragState {
@@ -183,6 +238,18 @@ interface TimelineThumbnail {
   src: string
 }
 
+interface TimelineThumbnailSample {
+  time: number
+  src: string
+  usedAt: number
+}
+
+interface TimelineBeatMarker {
+  key: string
+  time: number
+  left: number
+}
+
 interface TimelinePresetDropFlight {
   key: number
   presetId: number
@@ -192,7 +259,7 @@ interface TimelinePresetDropFlight {
   to: PresetDragRect
 }
 
-const timelineEventId = ref<number | null>(null)
+const timelineEventId = ref<number | null>(selectedEventId.value)
 const timelineContentRef = ref<HTMLDivElement | null>(null)
 const timelineScrollRef = ref<HTMLDivElement | null>(null)
 const timelineScrollbarRef = ref<HTMLDivElement | null>(null)
@@ -231,27 +298,54 @@ const syncTimelineViewportWidth = () => {
 }
 
 const timelineThumbnails = ref<TimelineThumbnail[]>([])
-const timelineWaveformCanvasRef = ref<HTMLCanvasElement | null>(null)
 const timelineWaveformReady = ref(false)
+const timelineWaveformLayerRef = ref<HTMLDivElement | null>(null)
+const timelineWaveformCanvasRef = ref<HTMLCanvasElement | null>(null)
 const timelinePlayheadRef = ref<HTMLDivElement | null>(null)
-const timelineClipProgressRefs = new Map<number, HTMLSpanElement>()
+const selectedTimelineTriggerIds = ref<number[]>([])
+const timelineClipboard = useState<TimelineClipboardPayload | null>(
+  'design_timeline_clipboard',
+  () => null
+)
+const timelineContextMenu = ref<TimelineContextMenuState>({
+  visible: false,
+  x: 0,
+  y: 0,
+  timeSeconds: 0,
+  track: 0
+})
+const timelinePointerPosition = ref<TimelinePointerPosition | null>(null)
+const timelineMarqueeRect = ref<TimelineMarqueeRect | null>(null)
 let timelineProgressRenderRafId: number | null = null
 const timelineInteractionMode = ref<TimelineInteractionMode | null>(null)
-const timelineDraggingTriggerId = ref<number | null>(null)
+const timelineInteractionPanButton = ref<0 | 1 | null>(null)
+const timelineDraggingTriggerIds = ref<number[]>([])
 const timelinePresetDropPosition = ref<number | null>(null)
 const timelinePresetDropTrack = ref<number | null>(null)
 const timelineDropAnimatingTriggerId = ref<number | null>(null)
 const timelineDuplicatingTriggerId = ref<number | null>(null)
 const timelinePresetDropFlight = ref<TimelinePresetDropFlight | null>(null)
 const timelinePresetDropFlightRef = ref<HTMLElement | null>(null)
+const timelineFillPreviews = ref<TimelineFillPreview[]>([])
+const timelineFillDraggingTriggerId = ref<number | null>(null)
+const timelineFillSourceStartPreview = ref<number | null>(null)
+const timelineFillSourceDurationPreview = ref<number | null>(null)
+const timelineFillRemovePreviewTriggerIds = ref<number[]>([])
 let timelineInteraction: TimelineInteractionState | null = null
+let timelineFillDragState: TimelineFillDragState | null = null
+let timelineClipDragGroup: TimelineClipDragGroup | null = null
 let timelineDropAnimationTimer: ReturnType<typeof setTimeout> | null = null
 let timelineDropAnimationSequence = 0
-let timelineClipDragPointerX = 0
-let timelineClipDragPointerY = 0
-let timelineClipDragGrabOffsetX = 0
-let timelineClipDragGrabOffsetY = 0
 let timelineClipDragDropped = false
+let timelineClipDragOffsetX = 0
+let timelineClipDragOffsetY = 0
+let timelineClipDragOffsetFrameId: number | null = null
+let timelinePresetDropFrameId: number | null = null
+let timelinePendingPresetDrop: {
+  position: number
+  track: number
+} | null = null
+let timelineNativeDragImage: HTMLElement | null = null
 let timelineScrollbarDrag: TimelineScrollbarDragState | null = null
 let timelineScrollbarHideTimer: ReturnType<typeof setTimeout> | null = null
 let timelineVerticalScrollbarDrag: TimelineVerticalScrollbarDragState | null = null
@@ -332,14 +426,11 @@ const selectedTimelineEvent = computed(() => {
 })
 
 const showDesignWorkspace = computed(() => {
-  if (designViewMode.value === 'timeline') {
-    return timelineEventId.value !== null
-  }
-  return activePreset.value !== null
+  return timelineEventId.value !== null
 })
 
 const animateDesignTargetSwitch = (element: HTMLElement | null) => {
-  if (disableAnimations.value || !element || typeof element.animate !== 'function') {
+  if (!element || typeof element.animate !== 'function') {
     return
   }
 
@@ -364,8 +455,6 @@ const animateDesignTargetSwitch = (element: HTMLElement | null) => {
 const animateTimelineTracksReveal = () => {
   const viewport = timelineTracksViewportRef.value
   if (
-    disableAnimations.value ||
-    designViewMode.value !== 'timeline' ||
     !viewport ||
     typeof viewport.animate !== 'function'
   ) {
@@ -396,14 +485,36 @@ const timelinePresetItems = computed<TimelinePresetItem[]>(() => {
   const event = selectedTimelineEvent.value
   if (!event) return []
 
-  return getEventPresetPlaybacks(event, presets.value).map(playback => ({
-    event,
-    playback,
-    startTime: playback.startTime,
-    durationSeconds: playback.durationMs / 1000,
-    color: playback.preset.effect?.color || 'var(--md-sys-color-primary, #8ab4f8)',
-    track: playback.track
-  }))
+  return getEventPresetPlaybacks(event).map((playback) => {
+    const resizePreview = timelinePresetResizePreview.value?.triggerId ===
+      playback.triggerId
+      ? timelinePresetResizePreview.value
+      : null
+    return {
+      event,
+      playback,
+      startTime: (
+        resizePreview?.startTime
+        ?? (
+          timelineFillDraggingTriggerId.value === playback.triggerId
+            ? timelineFillSourceStartPreview.value
+            : null
+        )
+        ?? playback.startTime
+      ),
+      durationSeconds: (
+        resizePreview?.durationSeconds
+        ?? (
+          timelineFillDraggingTriggerId.value === playback.triggerId
+            ? timelineFillSourceDurationPreview.value
+            : null
+        )
+        ?? playback.singleDurationMs / 1000
+      ),
+      color: playback.preset.effect?.color || 'var(--md-sys-color-primary, #8ab4f8)',
+      track: playback.track
+    }
+  })
 })
 
 const timelineTrackCount = computed(() => {
@@ -447,22 +558,39 @@ const timelineSelectedEventRange = computed(() => {
   if (!event || !isValidTriggerTime(event.time)) return null
 
   const startTime = parseTimeToSeconds(event.time)
-  const durationSeconds = (getEventRangeDurationMs(event, presets.value) ?? 0) / 1000
+  const resizePreview = timelinePresetResizePreview.value
+  const previewEndTime = resizePreview
+    ? resizePreview.startTime + resizePreview.durationSeconds
+    : 0
+  const durationSeconds = Math.max(
+    (getEventRangeDurationMs(event) ?? 0) / 1000,
+    previewEndTime - startTime
+  )
   return {
     startTime,
     durationSeconds: Math.max(TIMELINE_MIN_DURATION, durationSeconds)
   }
 })
 
-const timelineRangeStart = computed(() => {
+const timelinePresetResizePreview = ref<TimelinePresetResizePreview | null>(null)
+
+const timelineCommittedRangeStart = computed(() => {
   return timelineSelectedEventRange.value?.startTime ?? 0
 })
 
-const timelineRangeDuration = computed(() => {
+const timelineCommittedRangeDuration = computed(() => {
   return Math.max(
     TIMELINE_MIN_DURATION,
     timelineSelectedEventRange.value?.durationSeconds ?? TIMELINE_MIN_DURATION
   )
+})
+
+const timelineRangeStart = computed(() => {
+  return timelineCommittedRangeStart.value
+})
+
+const timelineRangeDuration = computed(() => {
+  return timelineCommittedRangeDuration.value
 })
 
 const timelineRangeEnd = computed(() => {
@@ -521,18 +649,6 @@ const renderTimelinePlaybackProgress = () => {
     }
   }
 
-  for (const item of timelinePresetItems.value) {
-    const progressElement = timelineClipProgressRefs.get(item.playback.triggerId)
-    if (!progressElement) continue
-
-    const progress = (
-      playingEventId.value === item.event.id &&
-      playingEventTriggerId.value === item.playback.triggerId
-    )
-      ? eventPlayProgress.value
-      : 0
-    progressElement.style.transform = `scaleX(${Math.max(0, Math.min(1, progress))})`
-  }
 }
 
 const scheduleTimelinePlaybackProgressRender = () => {
@@ -542,18 +658,6 @@ const scheduleTimelinePlaybackProgressRender = () => {
   }
   if (timelineProgressRenderRafId !== null) return
   timelineProgressRenderRafId = requestAnimationFrame(renderTimelinePlaybackProgress)
-}
-
-const setTimelineClipProgressRef = (
-  triggerId: number,
-  element: unknown
-) => {
-  if (element instanceof HTMLSpanElement) {
-    timelineClipProgressRefs.set(triggerId, element)
-  } else {
-    timelineClipProgressRefs.delete(triggerId)
-  }
-  scheduleTimelinePlaybackProgressRender()
 }
 
 const getTimelinePositionPercent = (time: number) => {
@@ -571,13 +675,74 @@ const getTimelineSpanPercent = (durationSeconds: number) => {
   )
 }
 
+const timelineBeatMarkers = computed<TimelineBeatMarker[]>(() => {
+  const anchor = beatGridAnchor.value
+  const period = beatGridPeriod.value
+  const rangeStart = timelineRangeStart.value
+  const rangeDuration = timelineRangeDuration.value
+  const rangeEnd = rangeStart + rangeDuration
+  if (
+    anchor === null
+    || period === null
+    || !Number.isFinite(anchor)
+    || !Number.isFinite(period)
+    || period <= 0
+    || rangeDuration <= 0
+  ) {
+    return []
+  }
+
+  const epsilon = Math.min(1e-4, period * 0.001)
+  const firstIndex = Math.ceil((rangeStart - anchor) / period - epsilon)
+  const lastIndex = Math.floor((rangeEnd - anchor) / period + epsilon)
+  if (
+    !Number.isFinite(firstIndex)
+    || !Number.isFinite(lastIndex)
+    || lastIndex < firstIndex
+  ) {
+    return []
+  }
+
+  const beatCount = lastIndex - firstIndex + 1
+  const pixelsPerBeat = (
+    timelinePixelWidth.value * period
+  ) / rangeDuration
+  const readableStep = Math.max(
+    1,
+    Math.ceil(4 / Math.max(pixelsPerBeat, 1e-6))
+  )
+  const markerStep = Math.max(
+    readableStep,
+    Math.ceil(beatCount / TIMELINE_BEAT_MARKER_LIMIT)
+  )
+  const markers: TimelineBeatMarker[] = []
+  for (
+    let beatIndex = firstIndex;
+    beatIndex <= lastIndex;
+    beatIndex += markerStep
+  ) {
+    const time = anchor + beatIndex * period
+    if (time < rangeStart - epsilon || time > rangeEnd + epsilon) continue
+
+    markers.push({
+      key: `timeline-beat-${beatIndex}`,
+      time,
+      left: Math.max(
+        0,
+        Math.min(100, ((time - rangeStart) / rangeDuration) * 100)
+      )
+    })
+  }
+  return markers
+})
+
 const timelinePresetDropTimeLabel = computed(() => {
   const position = timelinePresetDropPosition.value
   if (position === null) return ''
 
   const time = timelineRangeStart.value
     + (position / 100) * timelineRangeDuration.value
-  return formatVideoTime(time, timelineRangeEnd.value >= 3600)
+  return formatTimelineTime(time, timelineRangeEnd.value >= 3600)
 })
 
 const selectedTimelineEventLabel = computed(() => {
@@ -585,9 +750,9 @@ const selectedTimelineEventLabel = computed(() => {
   if (!event) return ''
 
   const startTime = isValidTriggerTime(event.time) ? parseTimeToSeconds(event.time) : 0
-  const durationSeconds = (getEventRangeDurationMs(event, presets.value) ?? 0) / 1000
-  const position = formatTriggerTime(startTime, timelineRangeEnd.value >= 3600)
-  return `ID ${event.id} · ${event.name} · ${position} · ${durationSeconds.toFixed(2)}s`
+  const durationSeconds = (getEventRangeDurationMs(event) ?? 0) / 1000
+  const position = formatTimelineTime(startTime, timelineRangeEnd.value >= 3600)
+  return `ID ${event.id} · ${event.name} · ${position} · ${Math.round(durationSeconds)}s`
 })
 
 const timelineDurationLabel = computed(() => {
@@ -599,12 +764,19 @@ const timelineCurrentTimeLabel = computed(() => {
 })
 
 const TIMELINE_RULER_STEPS = [
-  0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30,
+  1, 2, 5, 10, 15, 30,
   60, 120, 300, 600, 900, 1800, 3600, 7200
 ]
+const TIMELINE_RULER_TARGET_LABEL_WIDTH = 82
+const TIMELINE_MIN_RULER_STEP_SECONDS = 1
 
 const getTimelineRulerStep = (duration: number, pixelWidth: number) => {
-  const targetLabelCount = Math.max(2, Math.floor(Math.max(240, pixelWidth) / 82))
+  const targetLabelCount = Math.max(
+    2,
+    Math.floor(
+      Math.max(240, pixelWidth) / TIMELINE_RULER_TARGET_LABEL_WIDTH
+    )
+  )
   const rawStep = duration / targetLabelCount
   return TIMELINE_RULER_STEPS.find(step => step >= rawStep)
     ?? Math.ceil(rawStep / 3600) * 3600
@@ -612,7 +784,7 @@ const getTimelineRulerStep = (duration: number, pixelWidth: number) => {
 
 const getTimelineMinorTickStep = (majorStep: number) => {
   const divisor = [10, 5, 4, 2, 1].find(value => majorStep / value >= 0.05) ?? 1
-  return majorStep / divisor
+  return Math.max(TIMELINE_MIN_RULER_STEP_SECONDS, majorStep / divisor)
 }
 
 const timelineTicks = computed(() => {
@@ -637,7 +809,7 @@ const timelineTicks = computed(() => {
     ticks.push({
       time,
       left: (offset / duration) * 100,
-      label: formatTriggerTime(time, rangeEnd >= 3600),
+      label: formatTimelineTime(time, rangeEnd >= 3600),
       major
     })
   }
@@ -658,13 +830,35 @@ const timelineThumbnailCount = computed(() => {
   return Math.max(4, Math.min(48, Math.ceil(Math.max(320, timelinePixelWidth.value) / 144)))
 })
 
-// 波形仅保留当前事件区间的降采样峰值，避免解码整段视频或长期驻留 PCM。
+// 波形按固定绝对时间分桶缓存峰值，区间变化时只补采集缺失分桶。
 const TIMELINE_WAVEFORM_BASE_BINS = 65536
 const TIMELINE_WAVEFORM_CAPTURE_SAMPLE_RATE = 8000
 const TIMELINE_WAVEFORM_CAPTURE_BUFFER_SIZE = 256
+const TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS = 30
+const TIMELINE_WAVEFORM_CAPTURE_PREROLL_SECONDS = 8
+const TIMELINE_WAVEFORM_CACHE_BINS_PER_SECOND = 64
+const TIMELINE_WAVEFORM_CACHE_LIMIT = 2048
+const TIMELINE_WAVEFORM_CAPTURE_END_TOLERANCE_SECONDS = 0.02
+const TIMELINE_WAVEFORM_CAPTURE_MAX_ATTEMPTS = 3
+const TIMELINE_WAVEFORM_INTERACTION_IDLE_MS = 140
 let timelineWaveformBasePeaks: Float32Array | null = null
 let timelineWaveformMaxPeak = 0
 let timelineWaveformDrawRafId = 0
+let timelineWaveformInteractionActive = false
+let timelineWaveformRefreshPending = false
+let timelineWaveformInteractionTimer: ReturnType<typeof setTimeout> | null = null
+let timelineWaveformCacheRevision = 0
+let timelineWaveformPeaksRevision = -1
+
+interface TimelineWaveformCacheChunk {
+  start: number
+  end: number
+  peaks: Float32Array
+  maxPeak: number
+  capturedUntil: number
+  audioBlockCount: number
+  usedAt: number
+}
 
 interface TimelineThumbnailWorker {
   video: HTMLVideoElement
@@ -685,10 +879,12 @@ interface TimelineThumbnailEncoder {
 
 let timelineThumbnailTaskVersion = 0
 let timelineThumbnailDebounceTimer: ReturnType<typeof setTimeout> | null = null
-let timelineThumbnailCacheKey: string | null = null
+let timelineThumbnailCacheSource: string | null = null
+let timelineThumbnailSamples: TimelineThumbnailSample[] = []
 let timelineThumbnailWorkers: HTMLVideoElement[] = []
 let timelineThumbnailEncoders: TimelineThumbnailEncoder[] = []
 let timelineThumbnailEncoderRequestId = 0
+const TIMELINE_THUMBNAIL_CACHE_LIMIT = 512
 
 const stopTimelineThumbnailEncoders = () => {
   const encoders = [...timelineThumbnailEncoders]
@@ -812,9 +1008,41 @@ const stopTimelineThumbnailWorkers = () => {
   }
 }
 
+const resetTimelineThumbnailCache = (source: string | null = null) => {
+  timelineThumbnailCacheSource = source
+  timelineThumbnailSamples = []
+}
+
+const insertTimelineThumbnailSample = (
+  source: string,
+  time: number,
+  src: string
+) => {
+  if (timelineThumbnailCacheSource !== source) {
+    resetTimelineThumbnailCache(source)
+  }
+
+  const usedAt = Date.now()
+  const existingIndex = timelineThumbnailSamples.findIndex(sample => {
+    return Math.abs(sample.time - time) < 0.08
+  })
+  if (existingIndex >= 0) {
+    timelineThumbnailSamples[existingIndex] = { time, src, usedAt }
+  } else {
+    timelineThumbnailSamples.push({ time, src, usedAt })
+  }
+
+  if (timelineThumbnailSamples.length <= TIMELINE_THUMBNAIL_CACHE_LIMIT) {
+    return
+  }
+
+  timelineThumbnailSamples = timelineThumbnailSamples
+    .sort((a, b) => b.usedAt - a.usedAt)
+    .slice(0, TIMELINE_THUMBNAIL_CACHE_LIMIT)
+}
+
 const clearTimelineThumbnails = () => {
   timelineThumbnailTaskVersion++
-  timelineThumbnailCacheKey = null
   if (timelineThumbnailDebounceTimer) {
     clearTimeout(timelineThumbnailDebounceTimer)
     timelineThumbnailDebounceTimer = null
@@ -822,6 +1050,7 @@ const clearTimelineThumbnails = () => {
   timelineThumbnails.value = []
   stopTimelineThumbnailWorkers()
   stopTimelineThumbnailEncoders()
+  cancelRenderTask('thumbnail')
 }
 
 const waitForTimelineThumbnailEvent = (
@@ -950,18 +1179,21 @@ const getTimelineThumbnailWorkerCount = (count: number) => {
   return count > 1 ? 2 : count
 }
 
-const buildTimelineThumbnailOrder = (count: number) => {
-  if (count <= 1) return [0]
+const buildTimelineThumbnailOrder = (indexes: number[]) => {
+  if (indexes.length <= 1) return [...indexes]
 
-  const order = [0, count - 1]
+  const order = [indexes[0]!, indexes[indexes.length - 1]!]
   const addMiddleFirst = (start: number, end: number) => {
     if (start > end) return
     const middle = Math.floor((start + end) / 2)
-    order.push(middle)
+    const index = indexes[middle]
+    if (index !== undefined) {
+      order.push(index)
+    }
     addMiddleFirst(start, middle - 1)
     addMiddleFirst(middle + 1, end)
   }
-  addMiddleFirst(1, count - 2)
+  addMiddleFirst(1, indexes.length - 2)
   return order
 }
 
@@ -1023,7 +1255,7 @@ const createTimelineThumbnailWorker = async (
 }
 
 const buildTimelineThumbnailPreview = (
-  cached: TimelineThumbnail[],
+  cached: TimelineThumbnailSample[],
   count: number,
   rangeStart: number,
   rangeDuration: number,
@@ -1037,6 +1269,10 @@ const buildTimelineThumbnailPreview = (
   }
 
   const sortedCache = [...cached].sort((a, b) => a.time - b.time)
+  const maxReuseDistance = Math.max(
+    0.05,
+    (rangeDuration / Math.max(1, count)) * 1.2
+  )
   const preview: Array<TimelineThumbnail | null> = []
 
   for (let index = 0; index < count; index++) {
@@ -1067,7 +1303,13 @@ const buildTimelineThumbnailPreview = (
       ? after
       : before
 
-    preview.push(nearest
+    const canReuse = nearest
+      && Math.abs(nearest.time - time) <= maxReuseDistance
+    if (canReuse && nearest) {
+      nearest.usedAt = Date.now()
+    }
+
+    preview.push(canReuse && nearest
       ? {
           time,
           left: (index / count) * 100,
@@ -1124,8 +1366,8 @@ const generateTimelineThumbnails = async () => {
   const source = videoSrc.value
   const sourceDuration = videoDuration.value
   const count = timelineThumbnailCount.value
-  const rangeStart = timelineRangeStart.value
-  const rangeDuration = timelineRangeDuration.value
+  const rangeStart = timelineCommittedRangeStart.value
+  const rangeDuration = timelineCommittedRangeDuration.value
 
   if (
     !source ||
@@ -1137,37 +1379,34 @@ const generateTimelineThumbnails = async () => {
     return
   }
 
-  const cacheKey = `${source}|${rangeStart.toFixed(3)}|${rangeDuration.toFixed(3)}`
-  if (
-    timelineThumbnailCacheKey === cacheKey &&
-    timelineThumbnails.value.length >= count
-  ) {
-    return
+  if (timelineThumbnailCacheSource !== source) {
+    resetTimelineThumbnailCache(source)
   }
 
-  const taskVersion = ++timelineThumbnailTaskVersion
-  stopTimelineThumbnailWorkers()
-  const cachedThumbnails = timelineThumbnailCacheKey === cacheKey
-    ? [...timelineThumbnails.value]
-    : []
-  if (timelineThumbnailCacheKey !== cacheKey) {
-    timelineThumbnailCacheKey = cacheKey
-    timelineThumbnails.value = []
-  }
   const preview = buildTimelineThumbnailPreview(
-    cachedThumbnails,
+    timelineThumbnailSamples,
     count,
     rangeStart,
     rangeDuration,
     sourceDuration
   )
-  if (cachedThumbnails.length > 0) {
-    timelineThumbnails.value = preview.filter(
-      (thumbnail): thumbnail is TimelineThumbnail => thumbnail !== null
-    )
-  }
+  timelineThumbnails.value = preview.filter(
+    (thumbnail): thumbnail is TimelineThumbnail => thumbnail !== null
+  )
+  const missingIndexes = preview.flatMap((thumbnail, index) => {
+    return thumbnail ? [] : [index]
+  })
+  if (missingIndexes.length === 0) return
 
-  const workerCount = Math.min(count, getTimelineThumbnailWorkerCount(count))
+  const taskVersion = ++timelineThumbnailTaskVersion
+  const renderTaskToken = beginRenderTask('thumbnail')
+  let renderTaskFinished = false
+  stopTimelineThumbnailWorkers()
+
+  const workerCount = Math.min(
+    missingIndexes.length,
+    getTimelineThumbnailWorkerCount(missingIndexes.length)
+  )
   let workers: TimelineThumbnailWorker[] = []
   let encodersStarted = false
 
@@ -1197,7 +1436,7 @@ const generateTimelineThumbnails = async () => {
     startTimelineThumbnailEncoders(workers.length)
     encodersStarted = true
 
-    const order = buildTimelineThumbnailOrder(count)
+    const order = buildTimelineThumbnailOrder(missingIndexes)
     const generated: Array<TimelineThumbnail | null> = Array.from(
       { length: count },
       () => null
@@ -1274,8 +1513,14 @@ const generateTimelineThumbnails = async () => {
             width: (1 / count) * 100,
             src
           }
+          insertTimelineThumbnailSample(source, time, src)
           completedCount++
-          publish(completedCount === count)
+          updateRenderTask(
+            'thumbnail',
+            renderTaskToken,
+            completedCount / count
+          )
+          publish(completedCount === missingIndexes.length)
         }
       } finally {
         disposeTimelineThumbnailWorker(worker.video)
@@ -1290,6 +1535,7 @@ const generateTimelineThumbnails = async () => {
       source === videoSrc.value
     ) {
       publish(true)
+      renderTaskFinished = true
     }
   } finally {
     for (const worker of workers) {
@@ -1301,6 +1547,11 @@ const generateTimelineThumbnails = async () => {
       source === videoSrc.value
     ) {
       stopTimelineThumbnailEncoders()
+    }
+    if (renderTaskFinished) {
+      finishRenderTask('thumbnail', renderTaskToken)
+    } else {
+      cancelRenderTask('thumbnail', renderTaskToken)
     }
   }
 }
@@ -1334,6 +1585,8 @@ let timelineWaveformCaptureProcessor: ScriptProcessorNode | null = null
 let timelineWaveformCaptureGain: GainNode | null = null
 let timelineWaveformCaptureTimer: ReturnType<typeof setInterval> | null = null
 let timelineWaveformCaptureFinish: ((completed: boolean) => void) | null = null
+let timelineWaveformCacheSource: string | null = null
+const timelineWaveformCacheChunks = new Map<number, TimelineWaveformCacheChunk>()
 
 const getTimelineWaveformKey = (
   source: string,
@@ -1341,6 +1594,263 @@ const getTimelineWaveformKey = (
   rangeDuration: number
 ) => {
   return `${source}|${rangeStart.toFixed(3)}|${rangeDuration.toFixed(3)}`
+}
+
+const resetTimelineWaveformCache = (source: string | null = null) => {
+  timelineWaveformCacheSource = source
+  timelineWaveformCacheChunks.clear()
+  timelineWaveformCacheRevision++
+  timelineWaveformPeaksRevision = -1
+}
+
+const isTimelineWaveformChunkValid = (
+  chunk: TimelineWaveformCacheChunk
+) => {
+  return (
+    chunk.audioBlockCount > 0 &&
+    chunk.capturedUntil >= (
+      chunk.end - TIMELINE_WAVEFORM_CAPTURE_END_TOLERANCE_SECONDS
+    )
+  )
+}
+
+const clearTimelineWaveformInteractionTimer = () => {
+  if (timelineWaveformInteractionTimer) {
+    clearTimeout(timelineWaveformInteractionTimer)
+    timelineWaveformInteractionTimer = null
+  }
+}
+
+const trimTimelineWaveformCache = () => {
+  if (timelineWaveformCacheChunks.size <= TIMELINE_WAVEFORM_CACHE_LIMIT) return
+
+  const oldestChunks = [...timelineWaveformCacheChunks.entries()]
+    .sort((a, b) => a[1].usedAt - b[1].usedAt)
+  const removeCount = timelineWaveformCacheChunks.size - TIMELINE_WAVEFORM_CACHE_LIMIT
+  for (let index = 0; index < removeCount; index++) {
+    const entry = oldestChunks[index]
+    if (entry) {
+      timelineWaveformCacheChunks.delete(entry[0])
+    }
+  }
+}
+
+const publishTimelineWaveformChunks = () => {
+  if (timelineWaveformInteractionActive) {
+    timelineWaveformRefreshPending = true
+    return
+  }
+
+  const rangeStart = timelineCommittedRangeStart.value
+  const rangeDuration = timelineCommittedRangeDuration.value
+  const rangeEnd = rangeStart + rangeDuration
+  if (
+    timelineEventId.value === null ||
+    timelineWaveformBasePeaks === null ||
+    rangeDuration <= 0 ||
+    rangeEnd <= rangeStart
+  ) {
+    timelineWaveformReady.value = false
+    scheduleTimelineWaveformDraw()
+    return
+  }
+
+  const completedRangeEnd = Math.min(videoDuration.value, rangeEnd)
+  timelineWaveformReady.value = (
+    getTimelineWaveformMissingChunkIndexes(
+      rangeStart,
+      completedRangeEnd
+    ).length === 0
+  )
+  nextTick(scheduleTimelineWaveformDraw)
+}
+
+const refreshTimelineWaveformFromCache = () => {
+  timelineWaveformRefreshPending = false
+  const rangeStart = timelineCommittedRangeStart.value
+  const rangeDuration = Math.max(
+    TIMELINE_MIN_DURATION,
+    timelineCommittedRangeDuration.value
+  )
+  if (timelineEventId.value === null || rangeDuration <= 0) {
+    timelineWaveformBasePeaks = null
+    timelineWaveformMaxPeak = 0
+    timelineWaveformReady.value = false
+    scheduleTimelineWaveformDraw(true)
+    return
+  }
+
+  const rangeEnd = Math.min(
+    videoDuration.value,
+    rangeStart + rangeDuration
+  )
+  if (
+    getTimelineWaveformMissingChunkIndexes(rangeStart, rangeEnd).length > 0
+  ) {
+    timelineWaveformReady.value = false
+    scheduleTimelineWaveformDraw(true)
+    return
+  }
+
+  if (
+    timelineWaveformPeaksRevision !== timelineWaveformCacheRevision
+    || !timelineWaveformBasePeaks
+  ) {
+    const rangePeaks = buildTimelineWaveformRangePeaks(
+      rangeStart,
+      rangeDuration
+    )
+    timelineWaveformBasePeaks = rangePeaks.peaks
+    timelineWaveformMaxPeak = rangePeaks.maxPeak
+    timelineWaveformPeaksRevision = timelineWaveformCacheRevision
+  }
+
+  publishTimelineWaveformChunks()
+  scheduleTimelineWaveformDraw(true)
+}
+
+const finishTimelineWaveformInteraction = () => {
+  clearTimelineWaveformInteractionTimer()
+  timelineWaveformInteractionActive = false
+  if (timelineWaveformRefreshPending) {
+    refreshTimelineWaveformFromCache()
+  }
+}
+
+const beginTimelineWaveformInteraction = () => {
+  timelineWaveformInteractionActive = true
+  timelineWaveformRefreshPending = true
+  clearTimelineWaveformInteractionTimer()
+  timelineWaveformInteractionTimer = setTimeout(
+    finishTimelineWaveformInteraction,
+    TIMELINE_WAVEFORM_INTERACTION_IDLE_MS
+  )
+}
+
+const getTimelineWaveformCachePeak = (startTime: number, endTime: number) => {
+  if (endTime <= startTime) return 0
+
+  let peak = 0
+  const firstChunkIndex = Math.floor(
+    startTime / TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+  )
+  const lastChunkIndex = Math.floor(
+    Math.max(startTime, endTime - 1e-6)
+    / TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+  )
+
+  for (
+    let chunkIndex = firstChunkIndex;
+    chunkIndex <= lastChunkIndex;
+    chunkIndex++
+  ) {
+    const chunk = timelineWaveformCacheChunks.get(chunkIndex)
+    if (!chunk || !isTimelineWaveformChunkValid(chunk)) continue
+
+    const overlapStart = Math.max(startTime, chunk.start)
+    const overlapEnd = Math.min(endTime, chunk.end)
+    if (overlapEnd <= overlapStart) continue
+
+    const firstBin = Math.max(
+      0,
+      Math.floor(
+        (overlapStart - chunk.start) * TIMELINE_WAVEFORM_CACHE_BINS_PER_SECOND
+      )
+    )
+    const lastBin = Math.min(
+      chunk.peaks.length - 1,
+      Math.max(
+        firstBin,
+        Math.ceil(
+          (overlapEnd - chunk.start) * TIMELINE_WAVEFORM_CACHE_BINS_PER_SECOND
+        ) - 1
+      )
+    )
+
+    for (let bin = firstBin; bin <= lastBin; bin++) {
+      const value = chunk.peaks[bin] ?? 0
+      if (value > peak) peak = value
+    }
+  }
+
+  return peak
+}
+
+const touchTimelineWaveformCacheRange = (
+  rangeStart: number,
+  rangeEnd: number
+) => {
+  const firstChunkIndex = Math.floor(
+    rangeStart / TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+  )
+  const lastChunkIndex = Math.floor(
+    Math.max(rangeStart, rangeEnd - 1e-6)
+    / TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+  )
+  const usedAt = Date.now()
+
+  for (
+    let chunkIndex = firstChunkIndex;
+    chunkIndex <= lastChunkIndex;
+    chunkIndex++
+  ) {
+    const chunk = timelineWaveformCacheChunks.get(chunkIndex)
+    if (chunk && isTimelineWaveformChunkValid(chunk)) {
+      chunk.usedAt = usedAt
+    }
+  }
+}
+
+const buildTimelineWaveformRangePeaks = (
+  rangeStart: number,
+  rangeDuration: number
+) => {
+  const peaks = new Float32Array(TIMELINE_WAVEFORM_BASE_BINS)
+  let maxPeak = 0
+  const binDuration = rangeDuration / TIMELINE_WAVEFORM_BASE_BINS
+
+  for (let bin = 0; bin < TIMELINE_WAVEFORM_BASE_BINS; bin++) {
+    const startTime = rangeStart + bin * binDuration
+    const peak = getTimelineWaveformCachePeak(
+      startTime,
+      startTime + binDuration
+    )
+    peaks[bin] = peak
+    if (peak > maxPeak) maxPeak = peak
+  }
+  touchTimelineWaveformCacheRange(rangeStart, rangeStart + rangeDuration)
+
+  return {
+    peaks,
+    maxPeak: Math.max(0.001, maxPeak)
+  }
+}
+
+const getTimelineWaveformMissingChunkIndexes = (
+  rangeStart: number,
+  rangeEnd: number
+) => {
+  const firstChunkIndex = Math.floor(
+    rangeStart / TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+  )
+  const lastChunkIndex = Math.floor(
+    Math.max(rangeStart, rangeEnd - 1e-6)
+    / TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+  )
+  const missingChunkIndexes: number[] = []
+
+  for (
+    let chunkIndex = firstChunkIndex;
+    chunkIndex <= lastChunkIndex;
+    chunkIndex++
+  ) {
+    const chunk = timelineWaveformCacheChunks.get(chunkIndex)
+    if (!chunk || !isTimelineWaveformChunkValid(chunk)) {
+      missingChunkIndexes.push(chunkIndex)
+    }
+  }
+
+  return missingChunkIndexes
 }
 
 const closeTimelineWaveformContext = () => {
@@ -1392,42 +1902,43 @@ const clearTimelineWaveform = () => {
     clearTimeout(timelineWaveformLoadTimer)
     timelineWaveformLoadTimer = null
   }
+  clearTimelineWaveformInteractionTimer()
+  timelineWaveformInteractionActive = false
+  timelineWaveformRefreshPending = false
   timelineWaveformBasePeaks = null
   timelineWaveformMaxPeak = 0
+  timelineWaveformPeaksRevision = -1
   timelineWaveformReady.value = false
   stopTimelineWaveformCapture()
+  cancelRenderTask('waveform')
   closeTimelineWaveformContext()
   scheduleTimelineWaveformDraw()
 }
 
-const getTimelineWaveformPeak = (startBin: number, endBin: number) => {
-  const basePeaks = timelineWaveformBasePeaks
-  if (!basePeaks || endBin <= startBin) {
-    return 0
+const drawTimelineWaveform = (force = false) => {
+  timelineWaveformDrawRafId = 0
+  if (timelineWaveformInteractionActive && !force) {
+    timelineWaveformRefreshPending = true
+    return
   }
-
-  let peak = 0
-  const firstBin = Math.max(0, Math.floor(startBin))
-  const lastBin = Math.min(basePeaks.length - 1, Math.ceil(endBin))
-  for (let index = firstBin; index <= lastBin; index++) {
-    const value = basePeaks[index] ?? 0
-    if (value > peak) peak = value
-  }
-  return peak
-}
-
-const drawTimelineWaveform = () => {
-  if (designViewMode.value !== 'timeline' || timelineEventId.value === null) return
 
   const canvas = timelineWaveformCanvasRef.value
-  const content = timelineContentRef.value
-  if (!canvas || !content) return
+  const basePeaks = timelineWaveformBasePeaks
+  if (
+    timelineEventId.value === null ||
+    !timelineWaveformReady.value ||
+    !canvas ||
+    !basePeaks ||
+    basePeaks.length === 0
+  ) {
+    return
+  }
 
-  const contentWidth = Math.max(
-    1,
-    Math.round(content.getBoundingClientRect().width || timelinePixelWidth.value)
+  const rect = canvas.getBoundingClientRect()
+  const renderWidth = Math.min(
+    8192,
+    Math.max(1, Math.ceil(rect.width || canvas.clientWidth))
   )
-  const renderWidth = Math.min(contentWidth, 8192)
   const height = TIMELINE_WAVEFORM_LANE_HEIGHT
   const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
 
@@ -1438,20 +1949,14 @@ const drawTimelineWaveform = () => {
     canvas.width = Math.round(renderWidth * dpr)
     canvas.height = Math.round(height * dpr)
   }
-  canvas.style.width = `${contentWidth}px`
-  canvas.style.height = `${height}px`
 
   const context = canvas.getContext('2d')
   if (!context) return
   context.setTransform(dpr, 0, 0, dpr, 0, 0)
   context.clearRect(0, 0, renderWidth, height)
 
-  const basePeaks = timelineWaveformBasePeaks
-  if (!timelineWaveformReady.value || !basePeaks || basePeaks.length <= 0) return
-
   const centerY = height / 2
   const maxAmplitude = centerY - 2
-
   context.beginPath()
   context.moveTo(0, centerY + 0.5)
   context.lineTo(renderWidth, centerY + 0.5)
@@ -1459,18 +1964,29 @@ const drawTimelineWaveform = () => {
   context.lineWidth = 1
   context.stroke()
 
+  const binCount = basePeaks.length
   context.beginPath()
   for (let x = 0; x < renderWidth; x++) {
-    const binRangeStart = Math.floor((x / renderWidth) * basePeaks.length)
-    const binRangeEnd = Math.max(
-      binRangeStart + 1,
-      Math.ceil(((x + 1) / renderWidth) * basePeaks.length)
+    const firstBin = Math.max(
+      0,
+      Math.floor((x / renderWidth) * binCount)
     )
-    const peak = getTimelineWaveformPeak(
-      Math.min(binRangeStart, basePeaks.length - 1),
-      Math.min(binRangeEnd, basePeaks.length)
+    const lastBin = Math.max(
+      firstBin,
+      Math.min(
+        binCount - 1,
+        Math.ceil(((x + 1) / renderWidth) * binCount) - 1
+      )
     )
-    const normalizedPeak = Math.sqrt(peak / timelineWaveformMaxPeak)
+    let peak = 0
+    for (let bin = firstBin; bin <= lastBin; bin++) {
+      const value = basePeaks[bin] ?? 0
+      if (value > peak) peak = value
+    }
+
+    const normalizedPeak = Math.sqrt(
+      peak / Math.max(0.001, timelineWaveformMaxPeak)
+    )
     const amplitude = Math.max(0.6, normalizedPeak * maxAmplitude)
     const drawX = x + 0.5
     context.moveTo(drawX, centerY - amplitude)
@@ -1479,18 +1995,30 @@ const drawTimelineWaveform = () => {
   context.strokeStyle = 'rgba(138, 180, 248, 0.72)'
   context.lineWidth = 1
   context.stroke()
-
 }
 
-const scheduleTimelineWaveformDraw = () => {
+const setTimelineWaveformCanvasRef = (element: unknown) => {
+  timelineWaveformCanvasRef.value = element instanceof HTMLCanvasElement
+    ? element
+    : null
+  if (timelineWaveformCanvasRef.value) {
+    scheduleTimelineWaveformDraw()
+  }
+}
+
+const scheduleTimelineWaveformDraw = (force = false) => {
+  if (timelineWaveformInteractionActive && !force) {
+    timelineWaveformRefreshPending = true
+    return
+  }
   if (timelineWaveformDrawRafId) return
   if (typeof requestAnimationFrame === 'undefined') {
-    drawTimelineWaveform()
+    drawTimelineWaveform(force)
     return
   }
   timelineWaveformDrawRafId = requestAnimationFrame(() => {
     timelineWaveformDrawRafId = 0
-    drawTimelineWaveform()
+    drawTimelineWaveform(force)
   })
 }
 
@@ -1623,6 +2151,9 @@ const finishTimelineScrollbarDrag = (event: PointerEvent) => {
 }
 
 const handleTimelineScroll = () => {
+  closeTimelineContextMenu()
+  timelinePointerPosition.value = null
+  beginTimelineWaveformInteraction()
   const scroll = timelineScrollRef.value
   if (scroll) {
     timelineScrollLeft.value = scroll.scrollLeft
@@ -1758,6 +2289,8 @@ const finishTimelineVerticalScrollbarDrag = (event: PointerEvent) => {
 }
 
 const handleTimelineTracksScroll = () => {
+  closeTimelineContextMenu()
+  timelinePointerPosition.value = null
   const scroll = timelineTracksViewportRef.value
   if (scroll) {
     timelineTracksScrollTop.value = scroll.scrollTop
@@ -1772,7 +2305,8 @@ const captureTimelineWaveformByPlayback = async (
   rangeDuration: number,
   totalDuration: number,
   cacheKey: string,
-  taskVersion: number
+  taskVersion: number,
+  renderTaskToken: number
 ) => {
   if (
     typeof window === 'undefined' ||
@@ -1791,10 +2325,20 @@ const captureTimelineWaveformByPlayback = async (
 
   const rangeEnd = Math.min(totalDuration, rangeStart + rangeDuration)
   if (rangeEnd <= rangeStart) return null
+  const missingChunkIndexes = getTimelineWaveformMissingChunkIndexes(
+    rangeStart,
+    rangeEnd
+  )
+  if (missingChunkIndexes.length === 0) {
+    return buildTimelineWaveformRangePeaks(rangeStart, rangeDuration)
+  }
 
   const video = document.createElement('video')
   video.preload = 'auto'
   video.playsInline = true
+  video.preservesPitch = false
+  ;(video as HTMLVideoElement & { webkitPreservesPitch?: boolean })
+    .webkitPreservesPitch = false
   video.setAttribute('aria-hidden', 'true')
   video.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;'
   document.body.appendChild(video)
@@ -1854,7 +2398,15 @@ const captureTimelineWaveformByPlayback = async (
 
     // 等媒体真正有可定位的数据后再 seek，避免 loadedmetadata 阶段的
     // seeked 事件早于实际定位完成，导致音频仍从视频 0 秒输出。
-    const seekTarget = Math.max(0, Math.min(rangeStart, totalDuration))
+    const firstMissingChunkIndex = missingChunkIndexes[0] ?? 0
+    const seekTarget = Math.max(
+      0,
+      Math.min(
+        firstMissingChunkIndex * TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+          - TIMELINE_WAVEFORM_CAPTURE_PREROLL_SECONDS,
+        totalDuration
+      )
+    )
     if (Math.abs(video.currentTime - seekTarget) > 0.001 || video.seeking) {
       video.currentTime = seekTarget
       const seekStartedAt = performance.now()
@@ -1863,7 +2415,7 @@ const captureTimelineWaveformByPlayback = async (
           video.seeking ||
           Math.abs(video.currentTime - seekTarget) > 0.02
         ) &&
-        performance.now() - seekStartedAt < 6000
+        performance.now() - seekStartedAt < 12000
       ) {
         await new Promise<void>((resolve) => setTimeout(resolve, 16))
       }
@@ -1885,26 +2437,18 @@ const captureTimelineWaveformByPlayback = async (
     processor.connect(silentGain)
     timelineWaveformCaptureProcessor = processor
 
-    try {
-      video.playbackRate = rangeDuration <= 2
-        ? 2
-        : rangeDuration <= 5
-          ? 4
-          : rangeDuration <= 15
-            ? 8
-            : 16
-    } catch {
-      video.playbackRate = 4
-    }
-    const effectivePlaybackRate = Math.max(1, video.playbackRate || 1)
-    const binCount = TIMELINE_WAVEFORM_BASE_BINS
-    const peaks = new Float32Array(binCount)
-    let maxPeak = 0
+    let activePlaybackRate = 1
+    let activeChunkPeaks = new Float32Array(0)
+    let activeChunkMaxPeak = 0
     let lastPublishTime = 0
-    let capturedSourceSeconds = 0
-    let captureAnchorSourceTime = seekTarget
+    let captureAudioAnchorTime = 0
+    let captureSourceAnchorTime = seekTarget
     let captureStarted = false
     let captureArmed = false
+    let activeChunkStart = seekTarget
+    let activeChunkEnd = seekTarget
+    let activeChunkCapturedUntil = seekTarget
+    let activeChunkAudioBlockCount = 0
 
     const publishPeaks = (force = false) => {
       if (
@@ -1913,13 +2457,40 @@ const captureTimelineWaveformByPlayback = async (
       ) {
         return
       }
+      if (timelineWaveformInteractionActive) {
+        timelineWaveformRefreshPending = true
+        return
+      }
+      const rangeEnd = Math.min(
+        videoDuration.value,
+        rangeStart + rangeDuration
+      )
+      if (
+        getTimelineWaveformMissingChunkIndexes(rangeStart, rangeEnd).length > 0
+      ) {
+        timelineWaveformReady.value = false
+        return
+      }
       const now = performance.now()
       if (!force && now - lastPublishTime < 120) return
       lastPublishTime = now
-      timelineWaveformBasePeaks = peaks
-      timelineWaveformMaxPeak = Math.max(0.001, maxPeak)
-      timelineWaveformReady.value = true
-      scheduleTimelineWaveformDraw()
+      let peaksChanged = false
+      if (
+        timelineWaveformPeaksRevision !== timelineWaveformCacheRevision
+        || !timelineWaveformBasePeaks
+      ) {
+        const rangePeaks = buildTimelineWaveformRangePeaks(
+          rangeStart,
+          rangeDuration
+        )
+        timelineWaveformBasePeaks = rangePeaks.peaks
+        timelineWaveformMaxPeak = rangePeaks.maxPeak
+        timelineWaveformPeaksRevision = timelineWaveformCacheRevision
+        peaksChanged = true
+      }
+      if (peaksChanged || force) {
+        publishTimelineWaveformChunks()
+      }
     }
 
     processor.onaudioprocess = (event) => {
@@ -1929,118 +2500,336 @@ const captureTimelineWaveformByPlayback = async (
       ) {
         return
       }
-      if (!captureArmed || video.paused || video.ended) return
+      if (!captureArmed || (video.paused && !video.ended)) return
 
       const input = event.inputBuffer.getChannelData(0)
       const blockSourceDuration = (
         input.length / context.sampleRate
-      ) * effectivePlaybackRate
+      ) * activePlaybackRate
+      if (video.seeking) return
+
+      const blockPlaybackTime = Number.isFinite(event.playbackTime)
+        ? event.playbackTime
+        : context.currentTime
       const actualSourceTime = video.currentTime
-      const expectedBlockEnd = captureAnchorSourceTime
-        + capturedSourceSeconds
-        + blockSourceDuration
-      if (
-        Number.isFinite(actualSourceTime) &&
-        actualSourceTime + blockSourceDuration < rangeStart
-      ) {
-        return
-      }
       if (!captureStarted) {
         captureStarted = true
-        captureAnchorSourceTime = Math.max(
-          seekTarget,
-          actualSourceTime - blockSourceDuration
+        captureAudioAnchorTime = blockPlaybackTime
+        captureSourceAnchorTime = Math.max(
+          captureSourceAnchorTime,
+          Number.isFinite(actualSourceTime)
+            ? actualSourceTime - blockSourceDuration
+            : captureSourceAnchorTime
         )
-        capturedSourceSeconds = 0
-      } else if (
-        !video.seeking &&
-        Number.isFinite(actualSourceTime) &&
-        Math.abs(actualSourceTime - expectedBlockEnd) >
+      } else if (Number.isFinite(actualSourceTime)) {
+        const expectedBlockEnd = captureSourceAnchorTime
+          + Math.max(0, blockPlaybackTime - captureAudioAnchorTime) *
+            activePlaybackRate
+          + blockSourceDuration
+        if (
+          Math.abs(actualSourceTime - expectedBlockEnd) >
           Math.max(0.05, blockSourceDuration * 1.5)
-      ) {
-        captureAnchorSourceTime = Math.max(
-          seekTarget,
-          actualSourceTime - blockSourceDuration
-        )
-        capturedSourceSeconds = 0
+        ) {
+          captureSourceAnchorTime = Math.max(
+            0,
+            actualSourceTime - blockSourceDuration
+          )
+          captureAudioAnchorTime = blockPlaybackTime
+        }
       }
-
-      const callbackStartTime = captureAnchorSourceTime + capturedSourceSeconds
+      const callbackStartTime = captureSourceAnchorTime + Math.max(
+        0,
+        blockPlaybackTime - captureAudioAnchorTime
+      ) * activePlaybackRate
+      const callbackEndTime = callbackStartTime + blockSourceDuration
+      if (
+        callbackEndTime > activeChunkStart &&
+        callbackStartTime < activeChunkEnd
+      ) {
+        activeChunkAudioBlockCount++
+        activeChunkCapturedUntil = Math.max(
+          activeChunkCapturedUntil,
+          Math.min(callbackEndTime, activeChunkEnd)
+        )
+      }
       for (let index = 0; index < input.length; index++) {
         const sourceTime = callbackStartTime
-          + (index / context.sampleRate) * effectivePlaybackRate
-        if (sourceTime < rangeStart || sourceTime >= rangeEnd) continue
+          + (index / context.sampleRate) * activePlaybackRate
+        if (
+          sourceTime < activeChunkStart ||
+          sourceTime >= activeChunkEnd
+        ) {
+          continue
+        }
 
-        const relative = (sourceTime - rangeStart) / rangeDuration
+        const relative = sourceTime - activeChunkStart
         const bin = Math.max(
           0,
           Math.min(
-            binCount - 1,
-            Math.floor(relative * binCount)
+            activeChunkPeaks.length - 1,
+            Math.floor(relative * TIMELINE_WAVEFORM_CACHE_BINS_PER_SECOND)
           )
         )
         const peak = Math.abs(input[index] ?? 0)
-        if (peak > (peaks[bin] ?? 0)) {
-          peaks[bin] = peak
+        if (peak > (activeChunkPeaks[bin] ?? 0)) {
+          activeChunkPeaks[bin] = peak
         }
-        if (peak > maxPeak) maxPeak = peak
+        if (peak > activeChunkMaxPeak) activeChunkMaxPeak = peak
       }
-      capturedSourceSeconds += (
-        input.length / context.sampleRate
-      ) * effectivePlaybackRate
       publishPeaks()
+      if (
+        activeChunkCapturedUntil >= (
+          activeChunkEnd - TIMELINE_WAVEFORM_CAPTURE_END_TOLERANCE_SECONDS
+        )
+      ) {
+        captureArmed = false
+        timelineWaveformCaptureFinish?.(true)
+      }
     }
 
-    const playbackCompleted = new Promise<boolean>((resolve) => {
-      let settled = false
-      const cleanup = () => {
-        timelineWaveformCaptureFinish = null
-        if (timelineWaveformCaptureTimer) {
-          clearInterval(timelineWaveformCaptureTimer)
-          timelineWaveformCaptureTimer = null
-        }
-        video.removeEventListener('ended', handleEnded)
-        video.removeEventListener('error', handleError)
-      }
-      const finish = (completed: boolean) => {
-        if (settled) return
-        settled = true
-        cleanup()
-        resolve(completed)
-      }
-      const handleEnded = () => finish(true)
-      const handleError = () => finish(false)
-      const checkRange = () => {
-        if (
-          taskVersion !== timelineWaveformTaskVersion ||
-          cacheKey !== timelineWaveformLoadingKey
-        ) {
+    const waitForChunkBoundary = (chunkEnd: number) => (
+      new Promise<boolean>((resolve) => {
+        let settled = false
+        let endedAt = 0
+        const chunkDuration = Math.max(0, chunkEnd - activeChunkStart)
+        const timeoutId = setTimeout(() => {
           finish(false)
-          return
+        }, Math.max(
+          12000,
+          (chunkDuration / Math.max(1, activePlaybackRate)) * 4000 + 5000
+        ))
+        const cleanup = () => {
+          clearTimeout(timeoutId)
+          if (timelineWaveformCaptureFinish === finish) {
+            timelineWaveformCaptureFinish = null
+          }
+          if (timelineWaveformCaptureTimer) {
+            clearInterval(timelineWaveformCaptureTimer)
+            timelineWaveformCaptureTimer = null
+          }
+          video.removeEventListener('ended', handleEnded)
+          video.removeEventListener('error', handleError)
         }
-        if (video.ended || video.currentTime >= rangeEnd - 0.001) {
-          finish(true)
+        const finish = (completed: boolean) => {
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve(completed)
+        }
+        const handleEnded = () => {
+          endedAt = performance.now()
+        }
+        const handleError = () => finish(false)
+        const checkRange = () => {
+          if (
+            taskVersion !== timelineWaveformTaskVersion ||
+            cacheKey !== timelineWaveformLoadingKey
+          ) {
+            finish(false)
+            return
+          }
+          if (
+            activeChunkCapturedUntil >= (
+              chunkEnd - TIMELINE_WAVEFORM_CAPTURE_END_TOLERANCE_SECONDS
+            )
+          ) {
+            finish(true)
+          } else if (
+            Number.isFinite(video.currentTime) &&
+            video.currentTime >= (
+              chunkEnd - TIMELINE_WAVEFORM_CAPTURE_END_TOLERANCE_SECONDS
+            )
+          ) {
+            finish(true)
+          } else if (
+            video.ended &&
+            endedAt > 0 &&
+            performance.now() - endedAt > 400
+          ) {
+            finish(
+              chunkEnd >= (
+                totalDuration - TIMELINE_WAVEFORM_CAPTURE_END_TOLERANCE_SECONDS
+              )
+            )
+          }
+        }
+
+        timelineWaveformCaptureFinish = finish
+        video.addEventListener('ended', handleEnded, { once: true })
+        video.addEventListener('error', handleError, { once: true })
+        timelineWaveformCaptureTimer = setInterval(checkRange, 32)
+        checkRange()
+      })
+    )
+
+    const chunkAttempts = new Map<number, number>()
+    for (
+      let missingIndex = 0;
+      missingIndex < missingChunkIndexes.length;
+      missingIndex++
+    ) {
+      const chunkIndex = missingChunkIndexes[missingIndex]
+      if (chunkIndex === undefined) continue
+
+      const chunkStart = chunkIndex * TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+      const chunkEnd = Math.min(
+        totalDuration,
+        chunkStart + TIMELINE_WAVEFORM_CAPTURE_CHUNK_SECONDS
+      )
+      if (chunkEnd <= chunkStart) continue
+
+      const attempt = chunkAttempts.get(chunkIndex) ?? 0
+      const isRetry = attempt > 0
+      const canRetry = attempt + 1 < TIMELINE_WAVEFORM_CAPTURE_MAX_ATTEMPTS
+      const captureSeekTarget = Math.max(
+        0,
+        chunkStart - TIMELINE_WAVEFORM_CAPTURE_PREROLL_SECONDS
+      )
+      if (missingIndex > 0 || isRetry) {
+        captureArmed = false
+        video.pause()
+        video.currentTime = captureSeekTarget
+        const seekStartedAt = performance.now()
+        while (
+          (
+            video.seeking ||
+            Math.abs(video.currentTime - captureSeekTarget) > 0.02
+          ) &&
+          performance.now() - seekStartedAt < 12000
+        ) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 16))
+        }
+        if (
+          video.seeking ||
+          Math.abs(video.currentTime - captureSeekTarget) > 0.02 ||
+          video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+        ) {
+          return null
         }
       }
 
-      timelineWaveformCaptureFinish = finish
-      video.addEventListener('ended', handleEnded, { once: true })
-      video.addEventListener('error', handleError, { once: true })
-      timelineWaveformCaptureTimer = setInterval(checkRange, 32)
-      checkRange()
-    })
+      activeChunkStart = chunkStart
+      activeChunkEnd = chunkEnd
+      captureSourceAnchorTime = captureSeekTarget
+      captureAudioAnchorTime = 0
+      captureStarted = false
+      const chunkDuration = chunkEnd - chunkStart
+      let requestedPlaybackRate = chunkDuration <= 2
+        ? 2
+        : chunkDuration <= 5
+          ? 4
+          : chunkDuration <= 15
+            ? 6
+            : 8
+      if (isRetry) {
+        requestedPlaybackRate = Math.max(
+          1,
+          Math.min(requestedPlaybackRate, 4 / attempt)
+        )
+      }
+      try {
+        video.playbackRate = requestedPlaybackRate
+      } catch {
+        requestedPlaybackRate = 4
+        video.playbackRate = requestedPlaybackRate
+      }
+      activePlaybackRate = Math.max(1, video.playbackRate || requestedPlaybackRate)
+      activeChunkPeaks = new Float32Array(
+        Math.max(
+          1,
+          Math.ceil(
+            chunkDuration * TIMELINE_WAVEFORM_CACHE_BINS_PER_SECOND
+          )
+        )
+      )
+      activeChunkMaxPeak = 0
+      activeChunkCapturedUntil = chunkStart
+      activeChunkAudioBlockCount = 0
 
-    captureArmed = true
-    await video.play()
-    if (!(await playbackCompleted)) return null
-    // 等待音频处理链把区间末尾的缓冲样本排空，避免末段波形缺失。
-    await new Promise<void>((resolve) => setTimeout(resolve, 240))
+      const chunkCompleted = waitForChunkBoundary(chunkEnd)
+      captureAudioAnchorTime = 0
+      captureSourceAnchorTime = captureSeekTarget
+      captureStarted = false
+      if (context.state !== 'running') {
+        try {
+          await context.resume()
+        } catch {
+          return null
+        }
+      }
+      captureArmed = true
+      try {
+        await video.play()
+      } catch {
+        captureArmed = false
+        if (canRetry) {
+          chunkAttempts.set(chunkIndex, attempt + 1)
+          await new Promise<void>((resolve) => setTimeout(resolve, 180))
+          missingIndex--
+          continue
+        }
+        return null
+      }
+      if (!(await chunkCompleted)) {
+        captureArmed = false
+        video.pause()
+        if (canRetry) {
+          chunkAttempts.set(chunkIndex, attempt + 1)
+          await new Promise<void>((resolve) => setTimeout(resolve, 180))
+          missingIndex--
+          continue
+        }
+        return null
+      }
+
+      // 等待音频链排空当前分段末尾的缓冲样本，再定位下一段。
+      await new Promise<void>((resolve) => setTimeout(resolve, 180))
+      if (
+        taskVersion !== timelineWaveformTaskVersion ||
+        cacheKey !== timelineWaveformLoadingKey
+      ) {
+        return null
+      }
+      const capturedChunk: TimelineWaveformCacheChunk = {
+        start: chunkStart,
+        end: chunkEnd,
+        peaks: activeChunkPeaks,
+        maxPeak: activeChunkMaxPeak,
+        capturedUntil: Math.min(activeChunkCapturedUntil, chunkEnd),
+        audioBlockCount: activeChunkAudioBlockCount,
+        usedAt: Date.now()
+      }
+      const chunkIsValid = isTimelineWaveformChunkValid(capturedChunk)
+      if (!chunkIsValid || capturedChunk.maxPeak <= 1e-6) {
+        captureArmed = false
+        video.pause()
+        if (canRetry) {
+          chunkAttempts.set(chunkIndex, attempt + 1)
+          await new Promise<void>((resolve) => setTimeout(resolve, 180))
+          missingIndex--
+          continue
+        }
+        if (!chunkIsValid) {
+          return null
+        }
+      }
+      timelineWaveformCacheChunks.set(chunkIndex, capturedChunk)
+      timelineWaveformCacheRevision++
+      trimTimelineWaveformCache()
+      publishPeaks(true)
+      updateRenderTask(
+        'waveform',
+        renderTaskToken,
+        (missingIndex + 1) / missingChunkIndexes.length
+      )
+      captureArmed = false
+      video.pause()
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 120))
     publishPeaks(true)
 
-    return {
-      peaks,
-      maxPeak: Math.max(0.001, maxPeak)
-    }
+    return buildTimelineWaveformRangePeaks(rangeStart, rangeDuration)
   } catch {
     return null
   } finally {
@@ -2050,8 +2839,8 @@ const captureTimelineWaveformByPlayback = async (
 
 const loadTimelineWaveform = async () => {
   const source = videoSrc.value
-  const rangeStart = timelineRangeStart.value
-  const rangeDuration = timelineRangeDuration.value
+  const rangeStart = timelineCommittedRangeStart.value
+  const rangeDuration = timelineCommittedRangeDuration.value
   const cacheKey = source
     ? getTimelineWaveformKey(source, rangeStart, rangeDuration)
     : null
@@ -2065,12 +2854,36 @@ const loadTimelineWaveform = async () => {
   ) {
     return
   }
+  if (timelineWaveformCacheSource !== source) {
+    resetTimelineWaveformCache(source)
+  }
+  const rangeEnd = Math.min(
+    videoDuration.value,
+    rangeStart + rangeDuration
+  )
+  if (
+    getTimelineWaveformMissingChunkIndexes(rangeStart, rangeEnd).length === 0
+  ) {
+    const rangePeaks = buildTimelineWaveformRangePeaks(
+      rangeStart,
+      rangeDuration
+    )
+    timelineWaveformBasePeaks = rangePeaks.peaks
+    timelineWaveformMaxPeak = rangePeaks.maxPeak
+    timelineWaveformPeaksRevision = timelineWaveformCacheRevision
+    timelineWaveformLoadedKey = cacheKey
+    publishTimelineWaveformChunks()
+    return
+  }
 
   const taskVersion = ++timelineWaveformTaskVersion
+  const renderTaskToken = beginRenderTask('waveform')
+  let renderTaskFinished = false
   timelineWaveformLoadingKey = cacheKey
   timelineWaveformReady.value = false
   timelineWaveformBasePeaks = null
   timelineWaveformMaxPeak = 0
+  timelineWaveformPeaksRevision = -1
   stopTimelineWaveformCapture()
 
   try {
@@ -2080,7 +2893,8 @@ const loadTimelineWaveform = async () => {
       rangeDuration,
       videoDuration.value,
       cacheKey,
-      taskVersion
+      taskVersion,
+      renderTaskToken
     )
     if (
       taskVersion !== timelineWaveformTaskVersion ||
@@ -2088,25 +2902,36 @@ const loadTimelineWaveform = async () => {
     ) {
       return
     }
-    if (!rangePeaks) return
+    renderTaskFinished = true
+    if (!rangePeaks) {
+      timelineWaveformBasePeaks = null
+      timelineWaveformMaxPeak = 0
+      timelineWaveformReady.value = false
+      scheduleTimelineWaveformDraw()
+      return
+    }
 
     timelineWaveformBasePeaks = rangePeaks.peaks
     timelineWaveformMaxPeak = rangePeaks.maxPeak
-    timelineWaveformReady.value = true
+    timelineWaveformPeaksRevision = timelineWaveformCacheRevision
     timelineWaveformLoadedKey = cacheKey
-    nextTick(() => {
-      scheduleTimelineWaveformDraw()
-    })
+    publishTimelineWaveformChunks()
   } catch {
     if (taskVersion === timelineWaveformTaskVersion) {
       timelineWaveformReady.value = false
       timelineWaveformBasePeaks = null
       timelineWaveformMaxPeak = 0
+      timelineWaveformPeaksRevision = -1
     }
   } finally {
     if (taskVersion === timelineWaveformTaskVersion) {
       timelineWaveformLoadingKey = null
       closeTimelineWaveformContext()
+    }
+    if (renderTaskFinished) {
+      finishRenderTask('waveform', renderTaskToken)
+    } else {
+      cancelRenderTask('waveform', renderTaskToken)
     }
   }
 }
@@ -2132,44 +2957,400 @@ const selectTimelineEvent = (event: EventItem) => {
   selectEvent(event.id)
 }
 
+const getTimelineClipElement = (triggerId: number) => {
+  return timelineContentRef.value?.querySelector<HTMLElement>(
+    `[data-timeline-trigger-id="${triggerId}"]`
+  ) ?? null
+}
+
+const animateTimelineClipRemoval = (clip: HTMLElement) => {
+  clip.classList.add('is-removing')
+  return new Promise<void>((resolve) => {
+    const animation = clip.animate(
+      [
+        {
+          opacity: 1,
+          transform: 'scaleX(1)',
+          transformOrigin: 'left center'
+        },
+        {
+          opacity: 0,
+          transform: 'scaleX(0.82)',
+          transformOrigin: 'left center'
+        }
+      ],
+      {
+        duration: 180,
+        easing: 'cubic-bezier(0.4, 0, 1, 1)',
+        fill: 'forwards'
+      }
+    )
+    animation.addEventListener('finish', () => resolve(), { once: true })
+    animation.addEventListener('cancel', () => resolve(), { once: true })
+  })
+}
+
+const removeTimelinePresetIds = async (
+  eventId: number,
+  triggerIds: number[]
+) => {
+  const availableTriggerIds = new Set(
+    timelinePresetItems.value
+      .filter(item => item.event.id === eventId)
+      .map(item => item.playback.triggerId)
+  )
+  const uniqueTriggerIds = [...new Set(triggerIds)].filter(
+    triggerId => availableTriggerIds.has(triggerId)
+  )
+  if (uniqueTriggerIds.length === 0) return
+
+  const removedIds = new Set(uniqueTriggerIds)
+  selectedTimelineTriggerIds.value = selectedTimelineTriggerIds.value.filter(
+    triggerId => !removedIds.has(triggerId)
+  )
+  const clips = uniqueTriggerIds
+    .map(getTimelineClipElement)
+    .filter((clip): clip is HTMLElement => clip !== null)
+  await Promise.all(clips.map(animateTimelineClipRemoval))
+
+  removeEventPresetTriggers(eventId, uniqueTriggerIds)
+}
+
 const removeTimelinePreset = async (item: TimelinePresetItem, event: MouseEvent) => {
   event.preventDefault()
   event.stopPropagation()
 
-  const target = event.currentTarget
-  const clip = target instanceof Element ? target.closest('.timeline-clip') : null
-  if (clip instanceof HTMLElement && !disableAnimations.value) {
-    clip.classList.add('is-removing')
-    await new Promise<void>((resolve) => {
-      const animation = clip.animate(
-        [
-          {
-            opacity: 1,
-            transform: 'scaleX(1)',
-            transformOrigin: 'left center'
-          },
-          {
-            opacity: 0,
-            transform: 'scaleX(0.82)',
-            transformOrigin: 'left center'
-          }
-        ],
-        {
-          duration: 180,
-          easing: 'cubic-bezier(0.4, 0, 1, 1)',
-          fill: 'forwards'
-        }
-      )
-      animation.addEventListener('finish', () => resolve(), { once: true })
-      animation.addEventListener('cancel', () => resolve(), { once: true })
-    })
+  const targetIds = selectedTimelineTriggerIds.value.includes(
+    item.playback.triggerId
+  )
+    ? selectedTimelineTriggerIds.value
+    : [item.playback.triggerId]
+  await removeTimelinePresetIds(item.event.id, targetIds)
+}
+
+const closeTimelineContextMenu = () => {
+  if (!timelineContextMenu.value.visible) return
+  timelineContextMenu.value.visible = false
+}
+
+const getTimelineTrackAtClientY = (clientY: number) => {
+  const viewport = timelineTracksViewportRef.value
+  if (!viewport) return null
+
+  const rect = viewport.getBoundingClientRect()
+  if (clientY < rect.top || clientY > rect.bottom) return null
+
+  const contentY = clientY - rect.top + viewport.scrollTop
+  const rawTrackIndex = Math.max(
+    0,
+    Math.floor(contentY / timelineTrackHeight.value)
+  )
+  const maxTrackIndex = Math.max(0, timelineTrackCount.value - 1)
+  return Math.min(rawTrackIndex, maxTrackIndex)
+}
+
+const handleTimelineTracksPointerMove = (event: PointerEvent) => {
+  showTimelineVerticalScrollbar()
+  const track = getTimelineTrackAtClientY(event.clientY)
+  if (track === null) return
+
+  timelinePointerPosition.value = {
+    timeSeconds: getTimelineSecondsAtClientX(event.clientX),
+    track
+  }
+}
+
+const handleTimelineTracksPointerLeave = () => {
+  timelinePointerPosition.value = null
+  hideTimelineVerticalScrollbarSoon()
+}
+
+const openTimelineContextMenu = (
+  item: TimelinePresetItem | null,
+  event: MouseEvent
+) => {
+  if (timelineEventId.value === null) return
+
+  event.preventDefault()
+  event.stopPropagation()
+  pauseTimelineFollow()
+  if (item) {
+    selectTimelineEvent(item.event)
+    if (!selectedTimelineTriggerIds.value.includes(item.playback.triggerId)) {
+      selectedTimelineTriggerIds.value = [item.playback.triggerId]
+    }
   }
 
-  removeEventPresetTrigger(item.event.id, item.playback.triggerId)
+  const menuWidth = 196
+  const menuHeight = 142
+  const viewportPadding = 8
+  const maxX = Math.max(
+    viewportPadding,
+    window.innerWidth - menuWidth - viewportPadding
+  )
+  const maxY = Math.max(
+    viewportPadding,
+    window.innerHeight - menuHeight - viewportPadding
+  )
+  timelineContextMenu.value = {
+    visible: true,
+    x: Math.max(viewportPadding, Math.min(event.clientX, maxX)),
+    y: Math.max(viewportPadding, Math.min(event.clientY, maxY)),
+    timeSeconds: getTimelineSecondsAtClientX(event.clientX),
+    track: getTimelineTrackAtClientY(event.clientY) ?? 0
+  }
+}
+
+const getTimelinePasteTarget = () => {
+  if (timelineContextMenu.value.visible) {
+    return {
+      timeSeconds: timelineContextMenu.value.timeSeconds,
+      track: timelineContextMenu.value.track
+    }
+  }
+  return timelinePointerPosition.value
+}
+
+const handleTimelineContextMenuPointerDown = (event: PointerEvent) => {
+  if (!timelineContextMenu.value.visible) return
+  const isInsideMenu = event.composedPath().some(
+    node => (
+      node instanceof HTMLElement &&
+      node.classList.contains('timeline-context-menu')
+    )
+  )
+  if (!isInsideMenu) {
+    closeTimelineContextMenu()
+  }
+}
+
+const isTimelineWorkspaceActive = () => {
+  const editor = timelineEditorRef.value
+  return (
+    editor !== null &&
+    editor.isConnected &&
+    editor.getClientRects().length > 0
+  )
+}
+
+const isEditableKeyboardTarget = (target: EventTarget | null) => {
+  if (!(target instanceof HTMLElement)) return false
+  const tagName = target.tagName.toLowerCase()
+  return (
+    tagName === 'input' ||
+    tagName === 'textarea' ||
+    target.isContentEditable
+  )
+}
+
+const getSelectedTimelinePresetItems = () => {
+  const selectedIds = new Set(selectedTimelineTriggerIds.value)
+  return timelinePresetItems.value.filter(item => (
+    selectedIds.has(item.playback.triggerId)
+  ))
+}
+
+const cloneTimelineClipboardPreset = (preset: PresetItem): PresetItem => ({
+  ...preset,
+  effect: preset.effect
+    ? {
+        ...preset.effect,
+        points: preset.effect.points.map(point => ({ ...point }))
+      }
+    : undefined
+})
+
+const copyTimelineSelection = () => {
+  const eventItem = selectedTimelineEvent.value
+  const items = getSelectedTimelinePresetItems()
+  if (!eventItem || items.length === 0) return false
+
+  const anchorTimeSeconds = Math.min(
+    ...items.map(item => item.startTime)
+  )
+  timelineClipboard.value = {
+    items: items.map(item => ({
+      sourceEventId: eventItem.id,
+      sourcePresetId: item.playback.preset.id,
+      preset: cloneTimelineClipboardPreset(item.playback.preset),
+      relativeStartSeconds: Math.max(
+        0,
+        item.startTime - anchorTimeSeconds
+      ),
+      durationMs: Math.max(50, Math.round(item.durationSeconds * 1000)),
+      track: item.track
+    }))
+  }
+  closeTimelineContextMenu()
+  return true
+}
+
+const cutTimelineSelection = async () => {
+  const eventId = timelineEventId.value
+  const triggerIds = [...selectedTimelineTriggerIds.value]
+  if (
+    eventId === null ||
+    triggerIds.length === 0 ||
+    !copyTimelineSelection()
+  ) {
+    return
+  }
+
+  await removeTimelinePresetIds(eventId, triggerIds)
+}
+
+const pasteTimelineClipboard = async () => {
+  const eventItem = selectedTimelineEvent.value
+  const clipboardItems = timelineClipboard.value?.items ?? []
+  const pasteTarget = getTimelinePasteTarget()
+  if (!eventItem || !pasteTarget || clipboardItems.length === 0) return false
+
+  pauseTimelineFollow()
+  const eventStartTime = isValidTriggerTime(eventItem.time)
+    ? parseTimeToSeconds(eventItem.time)
+    : 0
+  const eventEndTime = getEventEndTimeSeconds(eventItem) ?? Infinity
+  const pasteTime = Math.max(
+    eventStartTime,
+    Math.min(pasteTarget.timeSeconds, eventEndTime)
+  )
+  const clipboardAnchorTrack = Math.min(
+    ...clipboardItems.map(item => item.track)
+  )
+  const targetPresetIds = new Map<number, number>()
+  const pastedTriggerIds: number[] = []
+
+  for (const clipboardItem of clipboardItems) {
+    let targetPresetId: number | undefined
+    const canReusePreset = (
+      clipboardItem.sourceEventId === eventItem.id &&
+      getEventPresets(eventItem).some(
+        preset => preset.id === clipboardItem.sourcePresetId
+      )
+    )
+    if (canReusePreset) {
+      targetPresetId = clipboardItem.sourcePresetId
+    } else {
+      targetPresetId = targetPresetIds.get(clipboardItem.sourcePresetId)
+      if (targetPresetId === undefined) {
+        const importedPreset = importPresetToEvent(
+          eventItem.id,
+          clipboardItem.preset
+        )
+        if (!importedPreset) continue
+        targetPresetId = importedPreset.id
+        targetPresetIds.set(
+          clipboardItem.sourcePresetId,
+          importedPreset.id
+        )
+      }
+    }
+    if (targetPresetId === undefined) continue
+
+    const trigger = addEventPresetTrigger(
+      eventItem.id,
+      targetPresetId,
+      Math.max(
+        0,
+        pasteTime - eventStartTime + clipboardItem.relativeStartSeconds
+      ),
+      Math.max(
+        0,
+        pasteTarget.track + clipboardItem.track - clipboardAnchorTrack
+      ),
+      clipboardItem.durationMs
+    )
+    if (trigger) {
+      pastedTriggerIds.push(trigger.id)
+    }
+  }
+
+  if (pastedTriggerIds.length === 0) {
+    closeTimelineContextMenu()
+    return false
+  }
+
+  selectedTimelineTriggerIds.value = pastedTriggerIds
+  selectTimelineEvent(eventItem)
+  closeTimelineContextMenu()
+  await nextTick()
+  for (const triggerId of pastedTriggerIds) {
+    const clip = getTimelineClipElement(triggerId)
+    if (!clip || typeof clip.animate !== 'function') continue
+    clip.animate(
+      [
+        { opacity: 0.48, transform: 'scale(0.96)' },
+        { opacity: 1, transform: 'scale(1)' }
+      ],
+      {
+        duration: 180,
+        easing: 'cubic-bezier(0.2, 0, 0, 1)'
+      }
+    )
+  }
+  return true
+}
+
+const handleTimelineKeydown = (event: KeyboardEvent) => {
+  if (
+    event.key === 'Escape' &&
+    timelineContextMenu.value.visible
+  ) {
+    event.preventDefault()
+    closeTimelineContextMenu()
+    return
+  }
+
+  if (
+    isEditableKeyboardTarget(event.target) ||
+    !isTimelineWorkspaceActive()
+  ) {
+    return
+  }
+
+  const hasSelection = selectedTimelineTriggerIds.value.length > 0
+  const hasClipboard = (timelineClipboard.value?.items.length ?? 0) > 0
+  const hasPasteTarget = getTimelinePasteTarget() !== null
+  const isCommandModifier = event.ctrlKey || event.metaKey
+  if (isCommandModifier && !event.altKey && !event.shiftKey) {
+    const key = event.key.toLowerCase()
+    if (key === 'c' && hasSelection) {
+      event.preventDefault()
+      event.stopPropagation()
+      copyTimelineSelection()
+      return
+    }
+    if (key === 'x' && hasSelection) {
+      event.preventDefault()
+      event.stopPropagation()
+      void cutTimelineSelection()
+      return
+    }
+    if (key === 'v' && hasClipboard && hasPasteTarget) {
+      event.preventDefault()
+      event.stopPropagation()
+      void pasteTimelineClipboard()
+      return
+    }
+  }
+
+  if (
+    (event.key === 'Delete' || event.key === 'Backspace') &&
+    hasSelection &&
+    timelineEventId.value !== null
+  ) {
+    event.preventDefault()
+    event.stopPropagation()
+    void removeTimelinePresetIds(
+      timelineEventId.value,
+      selectedTimelineTriggerIds.value
+    )
+  }
 }
 
 const seekTimelinePreset = (item: TimelinePresetItem) => {
   pauseTimelineFollow()
+  selectedTimelineTriggerIds.value = [item.playback.triggerId]
   selectTimelineEvent(item.event)
   seekVideoTo(item.startTime)
 }
@@ -2186,12 +3367,12 @@ const duplicateTimelinePreset = async (item: TimelinePresetItem) => {
     item.event.id,
     item.playback.preset.id,
     duplicateOffset,
-    item.track
+    item.track,
+    item.playback.singleDurationMs
   )
   if (!trigger) return
 
   selectTimelineEvent(item.event)
-  if (disableAnimations.value) return
 
   timelineDuplicatingTriggerId.value = trigger.id
   await nextTick()
@@ -2246,6 +3427,354 @@ const duplicateTimelinePreset = async (item: TimelinePresetItem) => {
   animation.addEventListener('cancel', finishDuplicateAnimation, { once: true })
 }
 
+const getTimelineFillPointerTime = (clientX: number) => {
+  const content = timelineContentRef.value
+  if (!content) return timelineRangeStart.value
+
+  const rect = content.getBoundingClientRect()
+  if (rect.width <= 0) return timelineRangeStart.value
+
+  const ratio = (clientX - rect.left) / rect.width
+  return timelineRangeStart.value + ratio * timelineRangeDuration.value
+}
+
+const getTimelineFillMaxPreviewCount = (state: TimelineFillDragState) => {
+  const explicitEndTime = (
+    typeof state.item.event.endTime === 'string' &&
+    state.item.event.endTime.trim() &&
+    isValidTriggerTime(state.item.event.endTime)
+  )
+    ? parseTimeToSeconds(state.item.event.endTime)
+    : null
+  if (
+    explicitEndTime === null ||
+    explicitEndTime <= state.eventStartTime
+  ) {
+    return TIMELINE_FILL_MAX_PREVIEWS
+  }
+
+  const stepSeconds = Math.max(
+    TIMELINE_MIN_DURATION,
+    state.copyDurationSeconds
+  )
+  const maxRelativeOffset = Math.max(
+    0,
+    explicitEndTime - state.eventStartTime - 0.01
+  )
+  const sourceRelativeEnd = (
+    state.item.startTime - state.eventStartTime + stepSeconds
+  )
+  const remainingSeconds = maxRelativeOffset - sourceRelativeEnd
+  if (remainingSeconds < -1e-6) return 0
+
+  return Math.min(
+    TIMELINE_FILL_MAX_PREVIEWS,
+    Math.floor((Math.max(0, remainingSeconds) + 1e-6) / stepSeconds) + 1
+  )
+}
+
+const getTimelineFillRemovableItems = (state: TimelineFillDragState) => {
+  const selectedTriggerIds = new Set(selectedTimelineTriggerIds.value)
+  const useSelectedItems = (
+    selectedTriggerIds.size > 1 &&
+    selectedTriggerIds.has(state.item.playback.triggerId)
+  )
+
+  return timelinePresetItems.value
+    .filter((item) => {
+      const isSourceItem = (
+        item.playback.triggerId === state.item.playback.triggerId
+      )
+      if (!isSourceItem && item.startTime >= state.item.startTime) {
+        return false
+      }
+      return useSelectedItems
+        ? selectedTriggerIds.has(item.playback.triggerId)
+        : item.track === state.item.track
+    })
+    .sort((a, b) => a.startTime - b.startTime)
+}
+
+const clearTimelineFillPreview = (state: TimelineFillDragState | null) => {
+  if (state) {
+    state.copyStartTime = state.item.startTime
+    state.copyDurationSeconds = state.item.durationSeconds
+    state.direction = null
+    state.previewCount = 0
+    state.removePreviewTriggerIds = []
+  }
+  timelineFillSourceStartPreview.value = null
+  timelineFillSourceDurationPreview.value = null
+  timelineFillPreviews.value = []
+  timelineFillRemovePreviewTriggerIds.value = []
+}
+
+const updateTimelineFillPreviewAt = (clientX: number) => {
+  const state = timelineFillDragState
+  if (!state) return
+
+  const bpmIntervalSeconds = getTimelineBpmIntervalSeconds()
+  const sourceDurationSeconds = Math.max(
+    TIMELINE_MIN_DURATION,
+    state.item.durationSeconds
+  )
+  state.copyStartTime = bpmIntervalSeconds === null
+    ? state.item.startTime
+    : getTimelineBpmAlignedTime(state.item.startTime)
+  state.copyDurationSeconds = (
+    bpmIntervalSeconds !== null
+    && sourceDurationSeconds > bpmIntervalSeconds
+  )
+    ? Math.max(TIMELINE_MIN_DURATION, bpmIntervalSeconds)
+    : sourceDurationSeconds
+  timelineFillSourceStartPreview.value = null
+  timelineFillSourceDurationPreview.value = null
+  const stepSeconds = bpmIntervalSeconds
+    ?? Math.max(TIMELINE_MIN_DURATION, state.copyDurationSeconds)
+  const contentWidth = timelineContentRef.value?.getBoundingClientRect().width ?? 0
+  const secondsPerPixel = contentWidth > 0
+    ? timelineRangeDuration.value / contentWidth
+    : 0
+  const activationThreshold = Math.max(0.02, secondsPerPixel * 3)
+  const pointerTime = getTimelineBpmAlignedTime(
+    getTimelineFillPointerTime(clientX)
+  )
+  const sourceEndTime = state.item.startTime + sourceDurationSeconds
+  const distanceFromSourceEnd = (
+    pointerTime - sourceEndTime
+  )
+  const distanceFromSourceStart = state.copyStartTime - pointerTime
+  const maxPreviewCount = getTimelineFillMaxPreviewCount(state)
+
+  if (distanceFromSourceEnd >= activationThreshold && maxPreviewCount > 0) {
+    timelineFillSourceStartPreview.value = state.copyStartTime
+    timelineFillSourceDurationPreview.value = state.copyDurationSeconds
+    const nextPreviewCount = Math.min(
+      maxPreviewCount,
+      Math.floor((distanceFromSourceEnd + 1e-6) / stepSeconds) + 1
+    )
+    if (
+      state.direction === 'copy' &&
+      state.previewCount === nextPreviewCount
+    ) {
+      return
+    }
+
+    state.direction = 'copy'
+    state.previewCount = nextPreviewCount
+    state.removePreviewTriggerIds = []
+    timelineFillRemovePreviewTriggerIds.value = []
+    timelineFillPreviews.value = Array.from(
+      { length: nextPreviewCount },
+      (_, index) => ({
+        key: `${state.item.playback.triggerId}-fill-${index + 1}`,
+        startTime: state.copyStartTime + stepSeconds * (index + 1),
+        durationSeconds: state.copyDurationSeconds,
+        color: state.item.color,
+        track: state.item.track
+      })
+    )
+    return
+  }
+
+  if (distanceFromSourceStart >= activationThreshold) {
+    const removePreviewTriggerIds = getTimelineFillRemovableItems(state)
+      .filter(item => item.startTime >= pointerTime + activationThreshold)
+      .map(item => item.playback.triggerId)
+
+    const previewUnchanged = (
+      state.direction === 'remove' &&
+      state.removePreviewTriggerIds.length === removePreviewTriggerIds.length &&
+      state.removePreviewTriggerIds.every(
+        (triggerId, index) => triggerId === removePreviewTriggerIds[index]
+      )
+    )
+    if (previewUnchanged) return
+
+    if (removePreviewTriggerIds.length === 0) {
+      clearTimelineFillPreview(state)
+      return
+    }
+
+    state.direction = 'remove'
+    state.previewCount = 0
+    state.removePreviewTriggerIds = removePreviewTriggerIds
+    timelineFillPreviews.value = []
+    timelineFillRemovePreviewTriggerIds.value = removePreviewTriggerIds
+    return
+  }
+
+  if (state.direction !== null) {
+    clearTimelineFillPreview(state)
+  }
+}
+
+const updateTimelineFillPreview = (event: PointerEvent) => {
+  const state = timelineFillDragState
+  if (!state || event.pointerId !== state.pointerId) return
+
+  state.lastClientX = event.clientX
+  updateTimelineFillPreviewAt(event.clientX)
+}
+
+const getTimelineFillPreviewsForTrack = (trackIndex: number) => {
+  return timelineFillPreviews.value.filter(preview => preview.track === trackIndex)
+}
+
+const releaseTimelineFillPointerCapture = (state: TimelineFillDragState) => {
+  if (state.handle.hasPointerCapture(state.pointerId)) {
+    state.handle.releasePointerCapture(state.pointerId)
+  }
+}
+
+const finishTimelineClipFillDrag = (
+  event: PointerEvent,
+  commit: boolean,
+  preferLastPointer = false
+) => {
+  const state = timelineFillDragState
+  if (!state || event.pointerId !== state.pointerId) return
+
+  event.preventDefault()
+  event.stopPropagation()
+  const finalClientX = !preferLastPointer && Number.isFinite(event.clientX)
+    ? event.clientX
+    : state.lastClientX
+  state.lastClientX = finalClientX
+  if (commit) {
+    updateTimelineFillPreviewAt(finalClientX)
+  }
+  const previews = [...timelineFillPreviews.value]
+  const removePreviewTriggerIds = [
+    ...timelineFillRemovePreviewTriggerIds.value
+  ]
+  const copyDurationSeconds = state.copyDurationSeconds
+  const copyStartTime = state.copyStartTime
+  timelineFillDragState = null
+  timelineFillDraggingTriggerId.value = null
+  clearTimelineFillPreview(null)
+  releaseTimelineFillPointerCapture(state)
+
+  if (!commit) return
+
+  if (removePreviewTriggerIds.length > 0) {
+    removeEventPresetTriggers(
+      state.item.event.id,
+      removePreviewTriggerIds
+    )
+    selectTimelineEvent(state.item.event)
+    return
+  }
+
+  if (previews.length === 0) return
+
+  const offsets = previews.map(
+    preview => Math.max(0, preview.startTime - state.eventStartTime)
+  )
+  const copyDurationMs = Math.max(
+    TIMELINE_MIN_DURATION,
+    copyDurationSeconds
+  ) * 1000
+  updateEventPresetTriggerRange(
+    state.item.event.id,
+    state.item.playback.triggerId,
+    Math.max(0, copyStartTime - state.eventStartTime),
+    copyDurationMs
+  )
+  const triggers = addEventPresetTriggers(
+    state.item.event.id,
+    state.item.playback.preset.id,
+    offsets,
+    state.item.track,
+    copyDurationMs
+  )
+  if (triggers.length > 0) {
+    selectTimelineEvent(state.item.event)
+  }
+}
+
+const handleTimelineClipFillPointerDown = (
+  item: TimelinePresetItem,
+  event: PointerEvent
+) => {
+  if (event.button !== 0 || timelineFillDragState) return
+
+  const handle = event.currentTarget instanceof HTMLElement
+    ? event.currentTarget
+    : null
+  if (!handle) return
+
+  event.preventDefault()
+  event.stopPropagation()
+  pauseTimelineFollow()
+  try {
+    handle.setPointerCapture(event.pointerId)
+  } catch {}
+
+  timelineFillDragState = {
+    pointerId: event.pointerId,
+    handle,
+    item,
+    eventStartTime: isValidTriggerTime(item.event.time)
+      ? parseTimeToSeconds(item.event.time)
+      : 0,
+    lastClientX: event.clientX,
+    copyStartTime: item.startTime,
+    copyDurationSeconds: Math.max(
+      TIMELINE_MIN_DURATION,
+      item.durationSeconds
+    ),
+    direction: null,
+    previewCount: 0,
+    removePreviewTriggerIds: []
+  }
+  timelineFillDraggingTriggerId.value = item.playback.triggerId
+  clearTimelineFillPreview(timelineFillDragState)
+}
+
+const handleTimelineClipFillPointerMove = (event: PointerEvent) => {
+  if (!timelineFillDragState || event.pointerId !== timelineFillDragState.pointerId) return
+  event.preventDefault()
+  event.stopPropagation()
+  updateTimelineFillPreview(event)
+}
+
+const handleTimelineClipFillPointerUp = (event: PointerEvent) => {
+  finishTimelineClipFillDrag(event, true)
+}
+
+const handleTimelineClipFillPointerCancel = (event: PointerEvent) => {
+  const state = timelineFillDragState
+  if (!state) return
+
+  finishTimelineClipFillDrag(
+    event,
+    state.direction !== null,
+    true
+  )
+}
+
+const handleTimelineClipFillPointerLostCapture = (event: PointerEvent) => {
+  const state = timelineFillDragState
+  if (!state) return
+
+  finishTimelineClipFillDrag(
+    event,
+    state.direction !== null,
+    true
+  )
+}
+
+const cancelTimelineClipFillDrag = () => {
+  const state = timelineFillDragState
+  timelineFillDragState = null
+  timelineFillDraggingTriggerId.value = null
+  clearTimelineFillPreview(state)
+  if (state) {
+    releaseTimelineFillPointerCapture(state)
+  }
+}
+
 const readDraggedPresetPayload = (
   dataTransfer: DataTransfer | null
 ): PresetDragPayload | null => {
@@ -2271,6 +3800,11 @@ const readDraggedPresetPayload = (
       ) {
         return {
           id: parsed.id,
+          ...(typeof parsed.sourceEventId === 'number' &&
+              Number.isInteger(parsed.sourceEventId) &&
+              parsed.sourceEventId > 0
+            ? { sourceEventId: parsed.sourceEventId }
+            : {}),
           rect: {
             left: rect.left,
             top: rect.top,
@@ -2287,17 +3821,10 @@ const readDraggedPresetPayload = (
             : undefined
         }
       }
-    } catch {
-      // 兼容仅携带预设 ID 的旧拖放数据
-    }
+    } catch {}
   }
 
-  const rawValue = dataTransfer.getData(PRESET_DRAG_MIME)
-    || dataTransfer.getData('text/plain')
-  const normalizedValue = rawValue.startsWith(PRESET_DRAG_TEXT_PREFIX)
-    ? rawValue.slice(PRESET_DRAG_TEXT_PREFIX.length)
-    : rawValue
-  const presetId = Number.parseInt(normalizedValue, 10)
+  const presetId = Number.parseInt(dataTransfer.getData(PRESET_DRAG_MIME), 10)
   return Number.isInteger(presetId) && presetId > 0
     ? { id: presetId }
     : null
@@ -2333,6 +3860,73 @@ const readTimelineTriggerDragPayload = (
   return null
 }
 
+const commitTimelinePresetDropPosition = () => {
+  timelinePresetDropFrameId = null
+  const pending = timelinePendingPresetDrop
+  timelinePendingPresetDrop = null
+  if (!pending) return
+
+  timelinePresetDropPosition.value = pending.position
+  const trackChanged = timelinePresetDropTrack.value !== pending.track
+  if (trackChanged) {
+    timelinePresetDropTrack.value = pending.track
+  }
+  applyTimelinePresetDropPositionToDom(pending.position)
+  if (trackChanged) {
+    nextTick(() => applyTimelinePresetDropPositionToDom(pending.position))
+  }
+}
+
+const applyTimelinePresetDropPositionToDom = (position: number) => {
+  const content = timelineContentRef.value
+  const dropLine = content?.querySelector<HTMLElement>(
+    '.timeline-preset-drop-line'
+  )
+  const dropTime = content?.querySelector<HTMLElement>('.timeline-drop-time')
+  if (dropLine) {
+    dropLine.style.left = `${position}%`
+  }
+  if (dropTime) {
+    dropTime.style.left = `${position}%`
+    const time = timelineRangeStart.value
+      + (position / 100) * timelineRangeDuration.value
+    dropTime.textContent = formatTimelineTime(
+      time,
+      timelineRangeEnd.value >= 3600
+    )
+  }
+}
+
+const scheduleTimelinePresetDropPosition = (
+  position: number,
+  track: number
+) => {
+  timelinePendingPresetDrop = { position, track }
+  if (timelinePresetDropPosition.value === null) {
+    timelinePresetDropPosition.value = position
+    nextTick(() => {
+      const pending = timelinePendingPresetDrop
+      if (pending) {
+        applyTimelinePresetDropPositionToDom(pending.position)
+      }
+    })
+  }
+  if (timelinePresetDropFrameId !== null) return
+  timelinePresetDropFrameId = requestAnimationFrame(
+    commitTimelinePresetDropPosition
+  )
+}
+
+const clearTimelinePresetDropPosition = () => {
+  if (timelinePresetDropFrameId !== null) {
+    cancelAnimationFrame(timelinePresetDropFrameId)
+    timelinePresetDropFrameId = null
+  }
+  timelinePendingPresetDrop = null
+  timelinePresetDropPosition.value = null
+  timelinePresetDropTrack.value = null
+}
+
 const handleTimelinePresetDragOver = (event: DragEvent) => {
   const eventItem = selectedTimelineEvent.value
   const dataTransfer = event.dataTransfer
@@ -2345,8 +3939,7 @@ const handleTimelinePresetDragOver = (event: DragEvent) => {
     (
       !isTimelineTriggerDrag &&
       !dataTransfer.types.includes(PRESET_DRAG_META_MIME) &&
-      !dataTransfer.types.includes(PRESET_DRAG_MIME) &&
-      !dataTransfer.types.includes('text/plain')
+      !dataTransfer.types.includes(PRESET_DRAG_MIME)
     )
   ) {
     return
@@ -2355,10 +3948,28 @@ const handleTimelinePresetDragOver = (event: DragEvent) => {
   event.preventDefault()
   pauseTimelineFollow()
   dataTransfer.dropEffect = isTimelineTriggerDrag ? 'move' : 'copy'
-  timelinePresetDropPosition.value = getTimelinePositionPercent(
-    getTimelineSecondsAtClientX(event.clientX)
+  const presetLeftClientX = event.clientX - (
+    presetDragPointerOffsetX.value ?? 0
   )
-  timelinePresetDropTrack.value = getTimelineTrackIndexAtClientY(event.clientY)
+  const dragGroup = timelineClipDragGroup
+  const dragOffsetX = dragGroup
+    ? event.clientX - dragGroup.startClientX
+    : 0
+  const dragGroupLefts = dragGroup
+    ? dragGroup.items
+        .map(item => item.rect ? item.rect.left + dragOffsetX : null)
+        .filter((left): left is number => left !== null)
+    : []
+  const dropAnchorClientX = dragGroupLefts.length > 0
+    ? Math.min(...dragGroupLefts)
+    : presetLeftClientX
+  const dropTime = getBpmSnappedTimelineTime(
+    getTimelineSecondsAtClientX(dropAnchorClientX)
+  )
+  scheduleTimelinePresetDropPosition(
+    getTimelinePositionPercent(dropTime),
+    getTimelineTrackIndexAtClientY(event.clientY)
+  )
 }
 
 const handleTimelinePresetDragLeave = (event: DragEvent) => {
@@ -2366,8 +3977,7 @@ const handleTimelinePresetDragLeave = (event: DragEvent) => {
   const relatedTarget = event.relatedTarget as Node | null
   if (currentTarget && relatedTarget && currentTarget.contains(relatedTarget)) return
 
-  timelinePresetDropPosition.value = null
-  timelinePresetDropTrack.value = null
+  clearTimelinePresetDropPosition()
 }
 
 const finishTimelinePresetDropAnimation = (animationKey: number) => {
@@ -2384,11 +3994,13 @@ const finishTimelinePresetDropAnimation = (animationKey: number) => {
 const handleTimelinePresetDrop = async (event: DragEvent) => {
   pauseTimelineFollow()
   const eventItem = selectedTimelineEvent.value
+  const presetLeftClientX = event.clientX - (
+    presetDragPointerOffsetX.value ?? 0
+  )
   const timelineTrigger = readTimelineTriggerDragPayload(event.dataTransfer)
   const draggedPreset = readDraggedPresetPayload(event.dataTransfer)
   const dropTrack = getTimelineTrackIndexAtClientY(event.clientY)
-  timelinePresetDropPosition.value = null
-  timelinePresetDropTrack.value = null
+  clearTimelinePresetDropPosition()
 
   if (timelineTrigger) {
     const sourceEvent = events.value.find(
@@ -2398,21 +4010,91 @@ const handleTimelinePresetDrop = async (event: DragEvent) => {
 
     event.preventDefault()
     timelineClipDragDropped = true
-    timelineClipDragPointerX = event.clientX
-    timelineClipDragPointerY = event.clientY
     const eventStartTime = isValidTriggerTime(sourceEvent.time)
       ? parseTimeToSeconds(sourceEvent.time)
       : 0
-    const dropTime = getTimelineSecondsAtClientX(event.clientX)
-    updateEventPresetTriggerTime(
-      sourceEvent.id,
-      timelineTrigger.triggerId,
-      Math.max(0, dropTime - eventStartTime)
+    const timelineItem = timelinePresetItems.value.find(
+      item => item.playback.triggerId === timelineTrigger.triggerId
     )
-    updateEventPresetTriggerTrack(
+    const sourceTrigger = getEventPresetTriggers(sourceEvent).find(
+      trigger => trigger.id === timelineTrigger.triggerId
+    )
+    if (!timelineItem && !sourceTrigger) return
+
+    const dragGroup = timelineClipDragGroup?.eventId === sourceEvent.id
+      ? timelineClipDragGroup
+      : null
+    let dropAnchorClientX = presetLeftClientX
+    if (dragGroup) {
+      flushTimelineClipDragPreview()
+      for (const dragItem of dragGroup.items) {
+        dragItem.dropRect = dragItem.element?.isConnected
+          ? dragItem.element.getBoundingClientRect()
+          : null
+      }
+      const dropRects = dragGroup.items
+        .map(dragItem => dragItem.dropRect)
+        .filter((rect): rect is DOMRect => rect !== null)
+      if (dropRects.length > 0) {
+        dropAnchorClientX = Math.min(
+          ...dropRects.map(rect => rect.left)
+        )
+      }
+    }
+    const dragItems = dragGroup?.items ?? [{
+      triggerId: timelineTrigger.triggerId,
+      startTime: timelineItem?.startTime ?? (
+        eventStartTime + (
+          sourceTrigger && isValidTriggerTime(sourceTrigger.time)
+            ? parseTimeToSeconds(sourceTrigger.time)
+            : 0
+        )
+      ),
+      track: timelineItem?.track ?? sourceTrigger?.track ?? dropTrack,
+      rect: null,
+      dropRect: null,
+      element: null
+    }]
+    const primaryItem = dragItems.find(
+      item => item.triggerId === timelineTrigger.triggerId
+    ) ?? dragItems[0]
+    if (!primaryItem) return
+
+    const dropTime = getBpmSnappedTimelineTime(
+      getTimelineSecondsAtClientX(dropAnchorClientX)
+    )
+    const minStartTime = Math.min(
+      ...dragItems.map(item => item.startTime)
+    )
+    const maxStartTime = Math.max(
+      ...dragItems.map(item => item.startTime)
+    )
+    const hasExplicitEndTime = typeof sourceEvent.endTime === 'string'
+      && !!sourceEvent.endTime.trim()
+    const eventEndTime = hasExplicitEndTime
+      ? parseTimeToSeconds(sourceEvent.endTime)
+      : null
+    const maxAllowedStartTime = eventEndTime === null
+      ? Number.POSITIVE_INFINITY
+      : Math.max(eventStartTime, eventEndTime - 0.01)
+    const timeDelta = Math.max(
+      -minStartTime,
+      Math.min(
+        dropTime - (dragGroup ? minStartTime : primaryItem.startTime),
+        maxAllowedStartTime - maxStartTime
+      )
+    )
+    const trackDelta = Math.max(
+      -Math.min(...dragItems.map(item => item.track)),
+      dropTrack - primaryItem.track
+    )
+    updateEventPresetTriggers(
       sourceEvent.id,
-      timelineTrigger.triggerId,
-      dropTrack
+      dragItems.map(item => ({
+        triggerId: item.triggerId,
+        offsetSeconds: item.startTime + timeDelta - eventStartTime,
+        track: item.track + trackDelta
+      }))
     )
     selectTimelineEvent(sourceEvent)
     return
@@ -2420,22 +4102,34 @@ const handleTimelinePresetDrop = async (event: DragEvent) => {
 
   if (!eventItem || !draggedPreset) return
 
-  const preset = presets.value.find(item => item.id === draggedPreset.id)
+  const sourceEvent = draggedPreset.sourceEventId === undefined
+    ? null
+    : events.value.find(item => item.id === draggedPreset.sourceEventId) ?? null
+  if (!sourceEvent) return
+  const preset = getEventPresets(sourceEvent).find(
+    item => item.id === draggedPreset.id
+  )
   if (!preset) return
 
   event.preventDefault()
   const eventStartTime = isValidTriggerTime(eventItem.time)
     ? parseTimeToSeconds(eventItem.time)
     : 0
-  const dropTime = getTimelineSecondsAtClientX(event.clientX)
+  const dropTime = getBpmSnappedTimelineTime(
+    getTimelineSecondsAtClientX(presetLeftClientX)
+  )
+  const localPreset = sourceEvent?.id === eventItem.id
+    ? preset
+    : importPresetToEvent(eventItem.id, preset)
+  if (!localPreset) return
   const trigger = addEventPresetTrigger(
     eventItem.id,
-    preset.id,
+    localPreset.id,
     Math.max(0, dropTime - eventStartTime),
     dropTrack
   )
   if (!trigger) return
-  if (disableAnimations.value || !draggedPreset.rect) return
+  if (!draggedPreset.rect) return
 
   const animationKey = ++timelineDropAnimationSequence
   if (timelineDropAnimationTimer) {
@@ -2455,8 +4149,8 @@ const handleTimelinePresetDrop = async (event: DragEvent) => {
 
   const flight: TimelinePresetDropFlight = {
     key: animationKey,
-    presetId: preset.id,
-    presetName: preset.name,
+    presetId: localPreset.id,
+    presetName: localPreset.name,
     color: preset.effect?.color || '#ffffff',
     from: {
       left: event.clientX - (
@@ -2522,8 +4216,20 @@ const handleTimelinePresetDrop = async (event: DragEvent) => {
   }
 }
 
+const getTimelineMaxZoom = () => {
+  return TIMELINE_MAX_ZOOM
+}
+
+const timelineMaxZoom = computed(getTimelineMaxZoom)
+const isTimelineAtMaxZoom = computed(() => {
+  return timelineZoom.value >= timelineMaxZoom.value - 0.000001
+})
+
 const clampTimelineZoom = (value: number) => {
-  return Math.max(1, Number(value.toFixed(6)))
+  return Math.max(
+    1,
+    Math.min(getTimelineMaxZoom(), Number(value.toFixed(6)))
+  )
 }
 
 const setTimelineZoom = (delta: number) => {
@@ -2533,6 +4239,16 @@ const setTimelineZoom = (delta: number) => {
   showTimelineScrollbar()
 }
 
+watch(
+  [timelineRangeDuration, timelineViewportWidth],
+  () => {
+    const nextZoom = clampTimelineZoom(timelineZoom.value)
+    if (nextZoom !== timelineZoom.value) {
+      timelineZoom.value = nextZoom
+    }
+  }
+)
+
 const clampTimelineVerticalZoom = (value: number) => {
   return Math.max(
     TIMELINE_VERTICAL_ZOOM_MIN,
@@ -2541,6 +4257,8 @@ const clampTimelineVerticalZoom = (value: number) => {
 }
 
 const setTimelineVerticalZoom = (delta: number) => {
+  closeTimelineContextMenu()
+  timelinePointerPosition.value = null
   pauseTimelineFollow()
   timelineVerticalZoom.value = clampTimelineVerticalZoom(
     timelineVerticalZoom.value + delta
@@ -2580,19 +4298,21 @@ const handleTimelineWheel = (event: WheelEvent) => {
   const region = getTimelineWheelRegion(event.target)
   if (!region || !scroll || !content) return
 
-  if (region === 'tracks') {
-    const tracks = timelineTracksViewportRef.value
-    if (!tracks || event.deltaY === 0) return
+  if (timelineClipDragGroup) {
+    const rawDelta = event.deltaY !== 0 ? event.deltaY : event.deltaX
+    if (rawDelta === 0) return
 
+    beginTimelineWaveformInteraction()
     event.preventDefault()
+    pauseTimelineFollow()
     const delta = normalizeTimelineWheelDelta(
-      event.deltaY,
+      rawDelta,
       event.deltaMode,
-      tracks.clientHeight
+      scroll.clientHeight
     )
-    tracks.scrollTop += delta
-    scheduleTimelineVerticalScrollbarUpdate()
-    showTimelineVerticalScrollbar()
+    scroll.scrollLeft += delta
+    scheduleTimelineScrollbarUpdate()
+    showTimelineScrollbar()
     return
   }
 
@@ -2600,6 +4320,7 @@ const handleTimelineWheel = (event: WheelEvent) => {
     const rawDelta = event.deltaY !== 0 ? event.deltaY : event.deltaX
     if (rawDelta === 0) return
 
+    beginTimelineWaveformInteraction()
     event.preventDefault()
     pauseTimelineFollow()
     const delta = normalizeTimelineWheelDelta(
@@ -2615,6 +4336,7 @@ const handleTimelineWheel = (event: WheelEvent) => {
 
   if (event.deltaY === 0) return
 
+  beginTimelineWaveformInteraction()
   event.preventDefault()
   pauseTimelineFollow()
   syncTimelineViewportWidth()
@@ -2658,6 +4380,70 @@ const getTimelineSecondsAtClientX = (clientX: number) => {
   return Math.round(
     (timelineRangeStart.value + ratio * timelineRangeDuration.value) * 100
   ) / 100
+}
+
+const getBpmSnappedTimelineTime = (time: number) => {
+  const anchor = beatGridAnchor.value
+  const period = beatGridPeriod.value
+  const content = timelineContentRef.value
+  if (
+    anchor === null
+    || period === null
+    || !Number.isFinite(anchor)
+    || !Number.isFinite(period)
+    || period <= 0
+    || !Number.isFinite(time)
+    || !content
+  ) {
+    return time
+  }
+
+  const contentWidth = content.getBoundingClientRect().width
+  if (contentWidth <= 0 || timelineRangeDuration.value <= 0) return time
+
+  const nearestBeat = anchor + Math.round((time - anchor) / period) * period
+  const distance = nearestBeat - time
+  const radiusSeconds = (
+    TIMELINE_BPM_SNAP_RADIUS_PX / contentWidth
+  ) * timelineRangeDuration.value
+  if (radiusSeconds <= 0 || Math.abs(distance) > radiusSeconds) return time
+
+  const falloff = 1 - Math.abs(distance) / radiusSeconds
+  return Math.round(
+    (time + distance * falloff * TIMELINE_BPM_SNAP_STRENGTH) * 100
+  ) / 100
+}
+
+const getTimelineBpmAlignedTime = (time: number, minimumTime?: number) => {
+  const anchor = beatGridAnchor.value
+  const period = beatGridPeriod.value
+  if (
+    anchor === null
+    || period === null
+    || !Number.isFinite(anchor)
+    || !Number.isFinite(period)
+    || period <= 0
+    || !Number.isFinite(time)
+  ) {
+    return time
+  }
+
+  let alignedTime = anchor + Math.round((time - anchor) / period) * period
+  if (
+    minimumTime !== undefined
+    && Number.isFinite(minimumTime)
+    && alignedTime < minimumTime
+  ) {
+    alignedTime = anchor + Math.ceil((minimumTime - anchor) / period) * period
+  }
+  return Math.round(alignedTime * 100) / 100
+}
+
+const getTimelineBpmIntervalSeconds = () => {
+  const period = beatGridPeriod.value
+  return period !== null && Number.isFinite(period) && period > 0
+    ? period
+    : null
 }
 
 const getTimelineTrackIndexAtClientY = (clientY: number) => {
@@ -2712,6 +4498,159 @@ const followTimelinePlayhead = () => {
   scheduleTimelineWaveformDraw()
 }
 
+const getTimelineMarqueeClientRect = (event: PointerEvent) => {
+  const interaction = timelineInteraction
+  const viewport = timelineTracksViewportRef.value
+  if (!interaction || !viewport) return null
+
+  const viewportRect = viewport.getBoundingClientRect()
+  const startX = Math.max(
+    viewportRect.left,
+    Math.min(viewportRect.right, interaction.startClientX)
+  )
+  const startY = Math.max(
+    viewportRect.top,
+    Math.min(
+      viewportRect.bottom,
+      interaction.startClientY ?? event.clientY
+    )
+  )
+  const currentX = Math.max(
+    viewportRect.left,
+    Math.min(viewportRect.right, event.clientX)
+  )
+  const currentY = Math.max(
+    viewportRect.top,
+    Math.min(viewportRect.bottom, event.clientY)
+  )
+  const left = Math.min(startX, currentX)
+  const right = Math.max(startX, currentX)
+  const top = Math.min(startY, currentY)
+  const bottom = Math.max(startY, currentY)
+  const track = viewport.parentElement
+  const trackRect = track?.getBoundingClientRect() ?? viewportRect
+
+  return {
+    left,
+    right,
+    top,
+    bottom,
+    overlay: {
+      left: left - trackRect.left,
+      top: top - trackRect.top,
+      width: right - left,
+      height: bottom - top
+    }
+  }
+}
+
+const getTimelineTriggerIdsInClientRect = (
+  left: number,
+  top: number,
+  right: number,
+  bottom: number
+) => {
+  const triggerIds: number[] = []
+  for (const item of timelinePresetItems.value) {
+    const clip = getTimelineClipElement(item.playback.triggerId)
+    if (!clip) continue
+
+    const rect = clip.getBoundingClientRect()
+    if (
+      rect.width <= 0
+      || rect.height <= 0
+      || rect.right < left
+      || rect.left > right
+      || rect.bottom < top
+      || rect.top > bottom
+    ) {
+      continue
+    }
+    triggerIds.push(item.playback.triggerId)
+  }
+  return triggerIds
+}
+
+const startTimelineMarqueeSelection = (event: PointerEvent) => {
+  if (
+    event.button !== 0
+    || timelineInteraction
+    || timelineFillDragState
+    || timelineEventId.value === null
+  ) {
+    return
+  }
+
+  const viewport = timelineTracksViewportRef.value
+  if (!viewport) return
+  if (
+    event.target instanceof Element
+    && event.target.closest('.timeline-clip')
+  ) {
+    return
+  }
+
+  pauseTimelineFollow()
+  event.preventDefault()
+  try {
+    viewport.setPointerCapture(event.pointerId)
+  } catch {}
+
+  const additive = event.shiftKey || event.ctrlKey || event.metaKey
+  const initialSelectedTriggerIds = additive
+    ? [...selectedTimelineTriggerIds.value]
+    : []
+  selectedTimelineTriggerIds.value = initialSelectedTriggerIds
+  timelineInteraction = {
+    mode: 'marquee',
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    captureElement: viewport,
+    initialSelectedTriggerIds,
+    additive,
+    moved: false
+  }
+  timelineMarqueeRect.value = getTimelineMarqueeClientRect(event)?.overlay ?? null
+  timelineInteractionMode.value = 'marquee'
+}
+
+const startTimelineMiddleDrag = (event: PointerEvent) => {
+  if (
+    event.button !== 1
+    || timelineInteraction
+    || timelineFillDragState
+    || timelineEventId.value === null
+  ) {
+    return
+  }
+
+  const viewport = timelineTracksViewportRef.value
+  const scroll = timelineScrollRef.value
+  if (!viewport || !scroll) return
+
+  pauseTimelineFollow()
+  event.preventDefault()
+  event.stopPropagation()
+  try {
+    viewport.setPointerCapture(event.pointerId)
+  } catch {}
+
+  timelineInteraction = {
+    mode: 'pan',
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    captureElement: viewport,
+    initialScrollLeft: scroll.scrollLeft,
+    initialScrollTop: viewport.scrollTop,
+    panButton: 1,
+    moved: false
+  }
+  timelineInteractionMode.value = 'pan'
+  timelineInteractionPanButton.value = 1
+}
+
 const startTimelineMediaDrag = (event: PointerEvent, allowClickSeek = false) => {
   if (event.button !== 0) return
   pauseTimelineFollow()
@@ -2729,10 +4668,12 @@ const startTimelineMediaDrag = (event: PointerEvent, allowClickSeek = false) => 
     startClientX: event.clientX,
     captureElement: captureElement ?? undefined,
     initialScrollLeft: timelineScrollRef.value?.scrollLeft ?? 0,
+    panButton: 0,
     allowClickSeek,
     moved: false
   }
   timelineInteractionMode.value = 'pan'
+  timelineInteractionPanButton.value = 0
 }
 
 const startTimelinePlayheadDrag = (event: PointerEvent) => {
@@ -2757,6 +4698,55 @@ const startTimelinePlayheadDrag = (event: PointerEvent) => {
   timelineInteractionMode.value = 'playhead'
 }
 
+const startTimelinePresetResizeDrag = (
+  side: 'start' | 'end',
+  item: TimelinePresetItem,
+  event: PointerEvent
+) => {
+  if (
+    event.button !== 0
+    || timelineInteraction
+    || timelineFillDragState
+  ) {
+    return
+  }
+
+  const handle = event.currentTarget instanceof HTMLElement
+    ? event.currentTarget
+    : null
+  if (!handle) return
+
+  pauseTimelineFollow()
+  event.preventDefault()
+  event.stopPropagation()
+  try {
+    handle.setPointerCapture(event.pointerId)
+  } catch {}
+
+  const mode = side === 'start'
+    ? 'preset-resize-start'
+    : 'preset-resize-end'
+  timelineInteraction = {
+    mode,
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    captureElement: handle,
+    eventId: item.event.id,
+    triggerId: item.playback.triggerId,
+    initialClipStart: item.startTime,
+    initialClipDuration: item.durationSeconds,
+    pendingClipStart: item.startTime,
+    pendingClipDuration: item.durationSeconds,
+    moved: false
+  }
+  timelinePresetResizePreview.value = {
+    triggerId: item.playback.triggerId,
+    startTime: item.startTime,
+    durationSeconds: item.durationSeconds
+  }
+  timelineInteractionMode.value = mode
+}
+
 const handleTimelineRulerClick = (event: MouseEvent) => {
   if (event.button !== 0) return
   pauseTimelineFollow()
@@ -2774,124 +4764,279 @@ const handleTimelineClipDragStart = (
   }
 
   pauseTimelineFollow()
+  const isSelected = selectedTimelineTriggerIds.value.includes(
+    item.playback.triggerId
+  )
+  if (!isSelected) {
+    selectedTimelineTriggerIds.value = [item.playback.triggerId]
+  }
+  const dragItems = (
+    isSelected
+      ? timelinePresetItems.value.filter(timelineItem => (
+          selectedTimelineTriggerIds.value.includes(
+            timelineItem.playback.triggerId
+          )
+        ))
+      : [item]
+  ).map(timelineItem => {
+    const element = getTimelineClipElement(timelineItem.playback.triggerId)
+    return {
+      triggerId: timelineItem.playback.triggerId,
+      startTime: timelineItem.startTime,
+      track: timelineItem.track,
+      rect: element?.getBoundingClientRect() ?? null,
+      dropRect: null,
+      element
+    }
+  })
+  timelineClipDragGroup = {
+    eventId: item.event.id,
+    primaryTriggerId: item.playback.triggerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    items: dragItems
+  }
+  timelineDraggingTriggerIds.value = dragItems.map(
+    dragItem => dragItem.triggerId
+  )
+
   dataTransfer.effectAllowed = 'move'
   dataTransfer.setData(TIMELINE_TRIGGER_DRAG_MIME, JSON.stringify({
     eventId: item.event.id,
     triggerId: item.playback.triggerId
   }))
+  hideTimelineNativeDragImage(dataTransfer)
   const clip = event.currentTarget instanceof HTMLElement
     ? event.currentTarget
     : null
   if (clip) {
     const rect = clip.getBoundingClientRect()
-    timelineClipDragGrabOffsetX = event.clientX - rect.left
-    timelineClipDragGrabOffsetY = event.clientY - rect.top
-    if (!disableAnimations.value) {
-      clip.animate(
-        [
-          { opacity: 1, transform: 'scale(1)' },
-          { opacity: 0.58, transform: 'scale(0.97)' }
-        ],
-        {
-          id: TIMELINE_CLIP_DRAG_ANIMATION_ID,
-          duration: 140,
-          easing: 'ease-out',
-          fill: 'forwards'
-        }
+    presetDragPointerOffsetX.value = Math.max(
+      0,
+      Math.min(rect.width, event.clientX - rect.left)
+    )
+  }
+  timelineClipDragDropped = false
+}
+
+const applyTimelineClipDragPreview = () => {
+  timelineClipDragOffsetFrameId = null
+  const dragItems = timelineClipDragGroup?.items
+  if (!dragItems) return
+
+  const content = timelineContentRef.value
+  let previewOffsetX = timelineClipDragOffsetX
+  if (content && timelineRangeDuration.value > 0) {
+    const contentWidth = content.getBoundingClientRect().width
+    if (contentWidth > 0) {
+      const anchorStartTime = Math.min(
+        ...dragItems.map(dragItem => dragItem.startTime)
       )
+      const rawOffsetSeconds = (
+        timelineClipDragOffsetX / contentWidth
+      ) * timelineRangeDuration.value
+      const snappedStartTime = getBpmSnappedTimelineTime(
+        anchorStartTime + rawOffsetSeconds
+      )
+      previewOffsetX = (
+        (snappedStartTime - anchorStartTime) / timelineRangeDuration.value
+      ) * contentWidth
     }
   }
-  timelineClipDragPointerX = event.clientX
-  timelineClipDragPointerY = event.clientY
-  timelineClipDragDropped = false
-  timelineDraggingTriggerId.value = item.playback.triggerId
+
+  const transform = `translate3d(${previewOffsetX}px, ${timelineClipDragOffsetY}px, 0)`
+  for (const dragItem of dragItems) {
+    if (dragItem.element?.isConnected) {
+      dragItem.element.style.transform = transform
+    }
+  }
+}
+
+const flushTimelineClipDragPreview = () => {
+  if (timelineClipDragOffsetFrameId !== null) {
+    cancelAnimationFrame(timelineClipDragOffsetFrameId)
+    timelineClipDragOffsetFrameId = null
+  }
+  applyTimelineClipDragPreview()
+}
+
+const hideTimelineNativeDragImage = (dataTransfer: DataTransfer) => {
+  const dragImage = document.createElement('div')
+  dragImage.style.cssText = [
+    'position: fixed',
+    'left: -10px',
+    'top: -10px',
+    'width: 1px',
+    'height: 1px',
+    'opacity: 0',
+    'pointer-events: none'
+  ].join(';')
+  document.body.appendChild(dragImage)
+  dataTransfer.setDragImage(dragImage, 0, 0)
+  timelineNativeDragImage?.remove()
+  timelineNativeDragImage = dragImage
+}
+
+const clearTimelineNativeDragImage = () => {
+  timelineNativeDragImage?.remove()
+  timelineNativeDragImage = null
 }
 
 const handleTimelineClipDrag = (event: DragEvent) => {
-  timelineClipDragPointerX = event.clientX
-  timelineClipDragPointerY = event.clientY
+  const dragGroup = timelineClipDragGroup
+  if (
+    !dragGroup
+    || !Number.isFinite(event.clientX)
+    || !Number.isFinite(event.clientY)
+  ) {
+    return
+  }
+
+  timelineClipDragOffsetX = event.clientX - dragGroup.startClientX
+  timelineClipDragOffsetY = event.clientY - dragGroup.startClientY
+  if (timelineClipDragOffsetFrameId !== null) return
+
+  timelineClipDragOffsetFrameId = requestAnimationFrame(
+    applyTimelineClipDragPreview
+  )
+}
+
+const resetTimelineClipDragPreview = (
+  dragItems = timelineClipDragGroup?.items ?? []
+) => {
+  if (timelineClipDragOffsetFrameId !== null) {
+    cancelAnimationFrame(timelineClipDragOffsetFrameId)
+    timelineClipDragOffsetFrameId = null
+  }
+  timelineClipDragOffsetX = 0
+  timelineClipDragOffsetY = 0
+  for (const dragItem of dragItems) {
+    dragItem.element?.style.removeProperty('transform')
+  }
 }
 
 const handleTimelineClipDragEnd = async (
   item: TimelinePresetItem,
-  event: DragEvent
+  _event: DragEvent
 ) => {
-  if (Number.isFinite(event.clientX)) {
-    timelineClipDragPointerX = event.clientX
-  }
-  if (Number.isFinite(event.clientY)) {
-    timelineClipDragPointerY = event.clientY
-  }
-
-  const shouldAnimateDrop = timelineClipDragDropped && !disableAnimations.value
-  timelineDraggingTriggerId.value = null
-  timelinePresetDropPosition.value = null
-  timelinePresetDropTrack.value = null
+  const dragGroup = timelineClipDragGroup
+  const shouldAnimateDrop = timelineClipDragDropped
+  const dragItems = dragGroup?.items ?? [{
+    triggerId: item.playback.triggerId,
+    startTime: item.startTime,
+    track: item.track,
+    rect: null,
+    dropRect: null,
+    element: null
+  }]
+  timelineClipDragGroup = null
+  timelineDraggingTriggerIds.value = []
+  clearTimelinePresetDropPosition()
+  presetDragPointerOffsetX.value = null
   timelineClipDragDropped = false
 
   await nextTick()
-  const clip = timelineContentRef.value?.querySelector<HTMLElement>(
-    `[data-timeline-trigger-id="${item.playback.triggerId}"]`
-  )
-  if (!clip || typeof clip.animate !== 'function') return
+  clearTimelineNativeDragImage()
+  resetTimelineClipDragPreview(dragItems)
 
-  clip.getAnimations().forEach((animation) => {
-    if (animation.id === TIMELINE_CLIP_DRAG_ANIMATION_ID) {
-      animation.cancel()
+  for (const dragItem of dragItems) {
+    const clip = getTimelineClipElement(dragItem.triggerId)
+    if (!clip || typeof clip.animate !== 'function') continue
+
+    const startRect = dragItem.dropRect ?? dragItem.rect
+    if (shouldAnimateDrop && startRect) {
+      const clipRect = clip.getBoundingClientRect()
+      const translateX = startRect.left - clipRect.left
+      const translateY = startRect.top - clipRect.top
+      clip.animate(
+        [
+          {
+            opacity: 0.58,
+            transform: `translate3d(${translateX}px, ${translateY}px, 0) scale(0.97)`
+          },
+          {
+            opacity: 1,
+            transform: 'translate3d(0, 0, 0) scale(1)'
+          }
+        ],
+        {
+          duration: 320,
+          easing: 'cubic-bezier(0.2, 0, 0, 1)'
+        }
+      )
+      continue
     }
-  })
-
-  if (disableAnimations.value) return
-
-  if (shouldAnimateDrop) {
-    const clipRect = clip.getBoundingClientRect()
-    const dragLeft = timelineClipDragPointerX - timelineClipDragGrabOffsetX
-    const dragTop = timelineClipDragPointerY - timelineClipDragGrabOffsetY
-    const translateX = dragLeft - clipRect.left
-    const translateY = dragTop - clipRect.top
 
     clip.animate(
       [
-        {
-          opacity: 0.58,
-          transform: `translate3d(${translateX}px, ${translateY}px, 0) scale(0.97)`
-        },
-        {
-          opacity: 1,
-          transform: 'translate3d(0, 0, 0) scale(1)'
-        }
+        { opacity: 0.58, transform: 'scale(0.97)' },
+        { opacity: 1, transform: 'scale(1)' }
       ],
       {
-        duration: 320,
-        easing: 'cubic-bezier(0.2, 0, 0, 1)'
+        duration: 140,
+        easing: 'ease-out'
       }
     )
-    return
   }
-
-  clip.animate(
-    [
-      { opacity: 0.58, transform: 'scale(0.97)' },
-      { opacity: 1, transform: 'scale(1)' }
-    ],
-    {
-      duration: 140,
-      easing: 'ease-out'
-    }
-  )
 }
 
 const handleTimelinePointerMove = (event: PointerEvent) => {
   const interaction = timelineInteraction
   if (!interaction || event.pointerId !== interaction.pointerId) return
-  if ((event.buttons & 1) === 0) {
+  const activeButton = interaction.mode === 'pan' && interaction.panButton === 1
+    ? 4
+    : 1
+  if ((event.buttons & activeButton) === 0) {
     handleTimelinePointerUp(event)
+    return
+  }
+
+  if (interaction.mode === 'marquee') {
+    const deltaX = event.clientX - interaction.startClientX
+    const deltaY = event.clientY - (
+      interaction.startClientY ?? event.clientY
+    )
+    if (
+      !interaction.moved
+      && Math.hypot(deltaX, deltaY) < TIMELINE_MARQUEE_THRESHOLD
+    ) {
+      return
+    }
+
+    interaction.moved = true
+    event.preventDefault()
+    const clientRect = getTimelineMarqueeClientRect(event)
+    if (!clientRect) return
+
+    timelineMarqueeRect.value = clientRect.overlay
+    const triggerIds = getTimelineTriggerIdsInClientRect(
+      clientRect.left,
+      clientRect.top,
+      clientRect.right,
+      clientRect.bottom
+    )
+    selectedTimelineTriggerIds.value = [
+      ...new Set([
+        ...(interaction.additive
+          ? interaction.initialSelectedTriggerIds ?? []
+          : []),
+        ...triggerIds
+      ])
+    ]
     return
   }
 
   if (interaction.mode === 'pan') {
     const deltaX = event.clientX - interaction.startClientX
-    if (!interaction.moved && Math.abs(deltaX) < 3) return
+    const deltaY = event.clientY - (
+      interaction.startClientY ?? event.clientY
+    )
+    if (
+      !interaction.moved
+      && Math.hypot(deltaX, deltaY) < 3
+    ) {
+      return
+    }
 
     interaction.moved = true
     event.preventDefault()
@@ -2906,7 +5051,111 @@ const handleTimelinePointerMove = (event: PointerEvent) => {
         )
       )
     }
+    if (interaction.panButton === 1) {
+      const tracks = timelineTracksViewportRef.value
+      if (tracks) {
+        const maxScrollTop = Math.max(
+          0,
+          tracks.scrollHeight - tracks.clientHeight
+        )
+        tracks.scrollTop = Math.max(
+          0,
+          Math.min(
+            maxScrollTop,
+            (interaction.initialScrollTop ?? 0) - deltaY
+          )
+        )
+      }
+      scheduleTimelineVerticalScrollbarUpdate()
+      showTimelineVerticalScrollbar()
+    }
+    scheduleTimelineScrollbarUpdate()
+    showTimelineScrollbar()
     scheduleTimelineWaveformDraw()
+    return
+  }
+
+  if (
+    interaction.mode === 'preset-resize-start'
+    || interaction.mode === 'preset-resize-end'
+  ) {
+    if (
+      !interaction.moved
+      && Math.abs(event.clientX - interaction.startClientX) < 2
+    ) {
+      return
+    }
+    if (
+      interaction.eventId === undefined
+      || interaction.triggerId === undefined
+      || interaction.initialClipStart === undefined
+      || interaction.initialClipDuration === undefined
+    ) {
+      return
+    }
+
+    const eventItem = events.value.find(
+      item => item.id === interaction.eventId
+    )
+    if (!eventItem || !isValidTriggerTime(eventItem.time)) return
+
+    interaction.moved = true
+    event.preventDefault()
+    const eventStartTime = parseTimeToSeconds(eventItem.time)
+    const explicitEndTime = typeof eventItem.endTime === 'string'
+      && isValidTriggerTime(eventItem.endTime)
+      ? parseTimeToSeconds(eventItem.endTime)
+      : null
+    const deltaSeconds = (
+      getTimelineSecondsAtClientX(event.clientX)
+      - getTimelineSecondsAtClientX(interaction.startClientX)
+    )
+    const minDurationSeconds = 0.05
+    const initialEnd = (
+      interaction.initialClipStart + interaction.initialClipDuration
+    )
+    let nextStart = interaction.initialClipStart
+    let nextDuration = interaction.initialClipDuration
+
+    if (interaction.mode === 'preset-resize-start') {
+      const maxStart = Math.min(
+        initialEnd - minDurationSeconds,
+        explicitEndTime === null
+          ? Number.POSITIVE_INFINITY
+          : explicitEndTime - minDurationSeconds
+      )
+      nextStart = Math.max(
+        eventStartTime,
+        Math.min(
+          maxStart,
+          getBpmSnappedTimelineTime(
+            interaction.initialClipStart + deltaSeconds
+          )
+        )
+      )
+      nextDuration = Math.max(
+        minDurationSeconds,
+        initialEnd - nextStart
+      )
+    } else {
+      const maxEnd = explicitEndTime ?? Number.POSITIVE_INFINITY
+      const nextEnd = Math.max(
+        interaction.initialClipStart + minDurationSeconds,
+        Math.min(
+          maxEnd,
+          getBpmSnappedTimelineTime(initialEnd + deltaSeconds)
+        )
+      )
+      nextDuration = nextEnd - interaction.initialClipStart
+    }
+
+    interaction.pendingClipStart = nextStart
+    interaction.pendingClipDuration = nextDuration
+    timelinePresetResizePreview.value = {
+      triggerId: interaction.triggerId,
+      startTime: nextStart,
+      durationSeconds: nextDuration
+    }
     return
   }
 
@@ -2920,11 +5169,42 @@ const handleTimelinePointerUp = (event: PointerEvent) => {
   const interaction = timelineInteraction
   if (!interaction || event.pointerId !== interaction.pointerId) return
 
+  if (interaction.mode === 'marquee') {
+    if (event.type === 'pointercancel') {
+      selectedTimelineTriggerIds.value = [
+        ...(interaction.initialSelectedTriggerIds ?? [])
+      ]
+    }
+    timelineMarqueeRect.value = null
+  }
+
   if (interaction.mode === 'pan') {
     if (!interaction.moved && interaction.allowClickSeek && event.type !== 'pointercancel') {
       seekVideoTo(getTimelineSecondsAtClientX(event.clientX))
     }
   }
+  if (
+    interaction.moved
+    && event.type !== 'pointercancel'
+    && interaction.eventId !== undefined
+    && interaction.triggerId !== undefined
+    && interaction.pendingClipStart !== undefined
+    && interaction.pendingClipDuration !== undefined
+  ) {
+    const eventItem = events.value.find(
+      item => item.id === interaction.eventId
+    )
+    const eventStartTime = eventItem && isValidTriggerTime(eventItem.time)
+      ? parseTimeToSeconds(eventItem.time)
+      : 0
+    updateEventPresetTriggerRange(
+      interaction.eventId,
+      interaction.triggerId,
+      Math.max(0, interaction.pendingClipStart - eventStartTime),
+      interaction.pendingClipDuration * 1000
+    )
+  }
+  timelinePresetResizePreview.value = null
 
   const captureElement = interaction.captureElement
   if (captureElement?.hasPointerCapture(event.pointerId)) {
@@ -2933,15 +5213,12 @@ const handleTimelinePointerUp = (event: PointerEvent) => {
 
   timelineInteraction = null
   timelineInteractionMode.value = null
-  timelineDraggingTriggerId.value = null
+  timelineInteractionPanButton.value = null
+  timelineDraggingTriggerIds.value = []
+  resetTimelineClipDragPreview()
+  clearTimelineNativeDragImage()
+  timelineClipDragGroup = null
 }
-
-watch(selectedPresetId, () => {
-  if (timelineEventId.value !== null && !isEventRecording.value) {
-    selectEvent(null)
-    timelineEventId.value = null
-  }
-})
 
 watch(videoCurrentTime, () => {
   if (!timelineFollowEnabled.value) return
@@ -2954,12 +5231,14 @@ watch(timelineFollowEnabled, (enabled) => {
 }, { immediate: true })
 
 watch(timelineZoom, () => {
+  closeTimelineContextMenu()
+  timelinePointerPosition.value = null
+  beginTimelineWaveformInteraction()
   nextTick(() => {
     const scroll = timelineScrollRef.value
     if (scroll && timelineZoom.value <= 1) {
       scroll.scrollLeft = 0
     }
-    scheduleTimelineWaveformDraw()
     scheduleTimelineScrollbarUpdate()
   })
 })
@@ -2974,1575 +5253,7 @@ watch(
   }
 )
 
-// 当前编辑的活动曲线类别 ('brightness' | 'color')
-const activeCurveType = useState<'brightness' | 'color'>(
-  'design_active_curve_type',
-  () => 'brightness'
-)
-
-// 曲线编辑工具模式 ('pointer': 鼠标选择 | 'pen': 笔/调整节点 | 'add': 添加节点 | 'delete': 删除节点)
-export type CurveEditTool = 'pointer' | 'pen' | 'add' | 'delete'
-const activeEditTool = useState<CurveEditTool>('design_active_edit_tool', () => 'pointer')
-
-// 根据当前选中的操作工具动态切换画布指针样式
-const canvasCursorClass = computed(() => {
-  if (activeEditTool.value === 'pointer') {
-    return hoveredPoint.value ? 'cursor-pointer' : 'cursor-default'
-  }
-  if (activeEditTool.value === 'pen') {
-    return activeDragPoint.value ? 'cursor-grabbing' : (hoveredPoint.value ? 'cursor-grab' : 'cursor-default')
-  }
-  if (activeEditTool.value === 'add') {
-    return 'cursor-crosshair'
-  }
-  if (activeEditTool.value === 'delete') {
-    const isMid = hoveredPoint.value && hoveredPoint.value.index > 0 &&
-      hoveredPoint.value.index < (hoveredPoint.value.type === 'brightness' ? currentPoints.value.length - 1 : currentColorPoints.value.length - 1)
-    return isMid ? 'cursor-pointer' : 'cursor-default'
-  }
-  return 'cursor-default'
-})
-
-watch(activeEditTool, () => {
-  stopCanvasDrag()
-  hoveredPoint.value = null
-  drawCurve()
-})
-
-// 亮度曲线关键点列表 (默认 50% 亮度水平直线)
-const currentPoints = computed<PresetPoint[]>(() => {
-  const pts = activePreset.value?.effect?.points
-  if (!pts || pts.length === 0) {
-    return [
-      { x: 0, y: 0.5 },
-      { x: 1, y: 0.5 }
-    ]
-  }
-  return [...pts].sort((a, b) => a.x - b.x)
-})
-
-// 颜色曲线关键点列表 (默认 100% 纯白平直直线)
-const currentColorPoints = computed<PresetColorPoint[]>(() => {
-  const cps = activePreset.value?.effect?.colorPoints
-  if (!cps || cps.length === 0) {
-    return [
-      { x: 0, y: 1.0, color: currentColor.value },
-      { x: 1, y: 1.0, color: currentColor.value }
-    ]
-  }
-  // 若是旧版默认的双色倾斜或50%平直，自动规范为 100% 纯色平直
-  const [firstColorPoint, secondColorPoint] = cps
-  if (
-    cps.length === 2 &&
-    firstColorPoint &&
-    secondColorPoint &&
-    (firstColorPoint.y === 0.2 || firstColorPoint.y === 0.5) &&
-    (secondColorPoint.y === 0.8 || secondColorPoint.y === 0.5)
-  ) {
-    return [
-      { x: 0, y: 1.0, color: currentColor.value },
-      { x: 1, y: 1.0, color: currentColor.value }
-    ]
-  }
-  return [...cps]
-    .map(cp => normalizeColorPoint(cp, currentColor.value))
-    .sort((a, b) => a.x - b.x)
-})
-
-// 当前选中的渐变颜色节点索引
-const selectedColorNodeIndex = ref<number | null>(null)
-
-// -------------------------------------------------------------
-// 色彩转换工具函数 (HEX <-> RGB <-> HSV)
-// -------------------------------------------------------------
-const hexToRgb = (hex: string) => {
-  let clean = hex.replace(/^#/, '')
-  if (clean.length === 3) {
-    clean = clean.split('').map(c => c + c).join('')
-  }
-  const num = parseInt(clean, 16)
-  if (isNaN(num) || clean.length !== 6) {
-    return { r: 255, g: 255, b: 255 }
-  }
-  return {
-    r: (num >> 16) & 255,
-    g: (num >> 8) & 255,
-    b: num & 255
-  }
-}
-
-const rgbToHex = (r: number, g: number, b: number): string => {
-  const toHex = (n: number) => Math.round(Math.max(0, Math.min(255, n))).toString(16).padStart(2, '0')
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toLowerCase()
-}
-
-const rgbToHsv = (r: number, g: number, b: number) => {
-  r /= 255
-  g /= 255
-  b /= 255
-  const max = Math.max(r, g, b)
-  const min = Math.min(r, g, b)
-  const d = max - min
-  let h = 0
-  const s = max === 0 ? 0 : d / max
-  const v = max
-
-  if (d !== 0) {
-    switch (max) {
-      case r: h = (g - b) / d + (g < b ? 6 : 0); break
-      case g: h = (b - r) / d + 2; break
-      case b: h = (r - g) / d + 4; break
-    }
-    h /= 6
-  }
-  return { h: h * 360, s, v }
-}
-
-const hsvToRgb = (h: number, s: number, v: number) => {
-  h = (h % 360 + 360) % 360
-  const c = v * s
-  const x = c * (1 - Math.abs(((h / 60) % 2) - 1))
-  const m = v - c
-  let r1 = 0, g1 = 0, b1 = 0
-
-  if (h >= 0 && h < 60) { r1 = c; g1 = x; b1 = 0 }
-  else if (h >= 60 && h < 120) { r1 = x; g1 = c; b1 = 0 }
-  else if (h >= 120 && h < 180) { r1 = 0; g1 = c; b1 = x }
-  else if (h >= 180 && h < 240) { r1 = 0; g1 = x; b1 = c }
-  else if (h >= 240 && h < 300) { r1 = x; g1 = 0; b1 = c }
-  else { r1 = c; g1 = 0; b1 = x }
-
-  return {
-    r: Math.round((r1 + m) * 255),
-    g: Math.round((g1 + m) * 255),
-    b: Math.round((b1 + m) * 255)
-  }
-}
-
-const fallbackInputRef = ref<HTMLInputElement | null>(null)
-
-// 统一设色：若选中了颜色曲线节点，则为该节点设色；否则设为主颜色
-const setColor = (color: string) => {
-  if (!activePreset.value) return
-  const hex = color.toLowerCase()
-  const currentPts = [...currentColorPoints.value]
-  const selectedIndex = selectedColorNodeIndex.value
-  const selectedPoint = selectedIndex === null ? undefined : currentPts[selectedIndex]
-
-  if (selectedIndex !== null && selectedPoint) {
-    currentPts[selectedIndex] = normalizeColorPoint(
-      { ...selectedPoint, color: hex },
-      currentColor.value
-    )
-    updatePresetEffect(activePreset.value.id, { color: hex, colorPoints: currentPts })
-  } else {
-    // 若未选中特定节点，且当前颜色曲线所有节点颜色相同，则整体同步更新为该颜色
-    const firstPoint = currentPts[0]
-    const allSameColor = firstPoint
-      ? currentPts.every(cp => cp.color.toLowerCase() === firstPoint.color.toLowerCase())
-      : false
-    if (allSameColor) {
-      const updatedPts = currentPts.map(cp => normalizeColorPoint({ ...cp, color: hex }, currentColor.value))
-      updatePresetEffect(activePreset.value.id, { color: hex, colorPoints: updatedPts })
-    } else {
-      updatePresetEffect(activePreset.value.id, { color: hex })
-    }
-  }
-
-  drawCurve()
-}
-
-// -------------------------------------------------------------
-// 历史颜色系统 (无预设颜色，由输入框旁 + 按钮添加)
-// -------------------------------------------------------------
-const historyColors = useState<string[]>('design_history_colors', () => [])
-
-const loadHistoryColors = () => {
-  if (historyColors.value.length > 0) return
-  if (typeof window === 'undefined') return
-  try {
-    const raw = localStorage.getItem('lse_history_colors')
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) {
-        historyColors.value = parsed
-        return
-      }
-    }
-  } catch {}
-  historyColors.value = []
-}
-
-const saveHistoryColors = () => {
-  if (typeof window === 'undefined') return
-  try {
-    localStorage.setItem('lse_history_colors', JSON.stringify(historyColors.value))
-  } catch {}
-}
-
-const addColorToHistory = (hexColor: string) => {
-  const clean = (hexColor || '').trim().toLowerCase()
-  if (!/^#[0-9a-f]{6}$/.test(clean)) return
-
-  // 若已存在，先移除旧位置移到最前
-  const existingIdx = historyColors.value.indexOf(clean)
-  if (existingIdx !== -1) {
-    historyColors.value.splice(existingIdx, 1)
-  }
-  historyColors.value.unshift(clean)
-  if (historyColors.value.length > 15) {
-    historyColors.value.pop()
-  }
-  saveHistoryColors()
-}
-
-const removeHistoryColor = (idx: number, e: Event) => {
-  e.stopPropagation()
-  historyColors.value.splice(idx, 1)
-  saveHistoryColors()
-}
-
-const clearHistoryColors = () => {
-  historyColors.value = []
-  saveHistoryColors()
-}
-
-const addHexToHistory = () => {
-  const clean = (displayHex.value || '').trim().replace(/^#/, '')
-  if (/^[0-9A-Fa-f]{6}$/.test(clean)) {
-    const hex = '#' + clean.toLowerCase()
-    setColor(hex)
-    addColorToHistory(hex)
-  } else {
-    addColorToHistory(currentColor.value)
-  }
-}
-
-const addRgbToHistory = () => {
-  const parsed = parseRgbString(displayRgb.value)
-  if (parsed) {
-    const hex = rgbToHex(parsed.r, parsed.g, parsed.b)
-    setColor(hex)
-    addColorToHistory(hex)
-  } else {
-    addColorToHistory(currentColor.value)
-  }
-}
-
-// -------------------------------------------------------------
-// 吸色工具
-// -------------------------------------------------------------
-const applyPickedColor = (color: string) => {
-  setColor(color)
-  addColorToHistory(color)
-}
-
-const pickScreenColor = async () => {
-  if (typeof window !== 'undefined' && 'EyeDropper' in window) {
-    try {
-      const eyeDropper = new (window as any).EyeDropper()
-      const result = await eyeDropper.open()
-      if (result?.sRGBHex) {
-        applyPickedColor(result.sRGBHex)
-      }
-    } catch {}
-  } else {
-    fallbackInputRef.value?.click()
-  }
-}
-
-// -------------------------------------------------------------
-// HEX 文本框双向同步
-// -------------------------------------------------------------
-const hexInputVal = ref('')
-const isHexFocused = ref(false)
-
-const displayHex = computed(() => {
-  if (isHexFocused.value) return hexInputVal.value
-  return currentColor.value.replace(/^#/, '').toUpperCase()
-})
-
-const onHexFocus = () => {
-  isHexFocused.value = true
-  hexInputVal.value = currentColor.value.replace(/^#/, '').toUpperCase()
-}
-
-const onHexBlur = () => {
-  isHexFocused.value = false
-  const clean = hexInputVal.value.trim().replace(/^#/, '')
-  if (/^[0-9A-Fa-f]{6}$/.test(clean)) {
-    setColor('#' + clean)
-  }
-}
-
-const onHexInput = (e: Event) => {
-  const target = e.target as HTMLInputElement
-  const raw = target.value.trim().replace(/^#/, '')
-  hexInputVal.value = raw
-  if (/^[0-9A-Fa-f]{6}$/.test(raw)) {
-    setColor('#' + raw)
-  }
-}
-
-const onHexKeydown = (e: KeyboardEvent) => {
-  if (e.key === 'Enter') {
-    (e.target as HTMLInputElement).blur()
-  }
-}
-
-// -------------------------------------------------------------
-// RGB 数值输入框双向同步
-// -------------------------------------------------------------
-const rgbInputVal = ref('')
-const isRgbFocused = ref(false)
-
-const currentRgbObj = computed(() => {
-  return hexToRgb(currentColor.value)
-})
-
-const displayRgb = computed(() => {
-  if (isRgbFocused.value) return rgbInputVal.value
-  const rgb = currentRgbObj.value
-  return `${rgb.r}, ${rgb.g}, ${rgb.b}`
-})
-
-const onRgbFocus = () => {
-  isRgbFocused.value = true
-  const rgb = currentRgbObj.value
-  rgbInputVal.value = `${rgb.r}, ${rgb.g}, ${rgb.b}`
-}
-
-const parseRgbString = (val: string): { r: number; g: number; b: number } | null => {
-  const parts = val.replace(/[^0-9,\s]/g, '').trim().split(/[,\s]+/).filter(Boolean)
-  const [rPart, gPart, bPart] = parts
-  if (rPart && gPart && bPart) {
-    const r = Math.max(0, Math.min(255, parseInt(rPart, 10)))
-    const g = Math.max(0, Math.min(255, parseInt(gPart, 10)))
-    const b = Math.max(0, Math.min(255, parseInt(bPart, 10)))
-    if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
-      return { r, g, b }
-    }
-  }
-  return null
-}
-
-const onRgbBlur = () => {
-  isRgbFocused.value = false
-  const parsed = parseRgbString(rgbInputVal.value)
-  if (parsed) {
-    setColor(rgbToHex(parsed.r, parsed.g, parsed.b))
-  }
-}
-
-const onRgbInput = (e: Event) => {
-  const target = e.target as HTMLInputElement
-  rgbInputVal.value = target.value
-  const parsed = parseRgbString(target.value)
-  if (parsed) {
-    setColor(rgbToHex(parsed.r, parsed.g, parsed.b))
-  }
-}
-
-const onRgbKeydown = (e: KeyboardEvent) => {
-  if (e.key === 'Enter') {
-    (e.target as HTMLInputElement).blur()
-  }
-}
-
-// -------------------------------------------------------------
-// 重复次数与周期时长控制 (可直接输入，也可微调)
-// -------------------------------------------------------------
-const repeatInputVal = ref('')
-const isRepeatFocused = ref(false)
-
-const displayRepeat = computed(() => {
-  if (isRepeatFocused.value) return repeatInputVal.value
-  return currentRepeat.value.toString()
-})
-
-const onRepeatFocus = () => {
-  isRepeatFocused.value = true
-  repeatInputVal.value = currentRepeat.value.toString()
-}
-
-const onRepeatBlur = () => {
-  isRepeatFocused.value = false
-  let val = parseInt(repeatInputVal.value, 10)
-  if (isNaN(val) || val < 1) val = 1
-  if (val > 99) val = 99
-  if (activePreset.value) {
-    updatePresetEffect(activePreset.value.id, { repeat: val })
-  }
-}
-
-const onRepeatInput = (e: Event) => {
-  const target = e.target as HTMLInputElement
-  repeatInputVal.value = target.value
-  const val = parseInt(target.value, 10)
-  if (!isNaN(val) && val >= 1 && val <= 99 && activePreset.value) {
-    updatePresetEffect(activePreset.value.id, { repeat: val })
-  }
-}
-
-const onRepeatKeydown = (e: KeyboardEvent) => {
-  if (e.key === 'Enter') {
-    (e.target as HTMLInputElement).blur()
-  } else if (e.key === 'ArrowUp') {
-    e.preventDefault()
-    changeRepeat(1)
-  } else if (e.key === 'ArrowDown') {
-    e.preventDefault()
-    changeRepeat(-1)
-  }
-}
-
-const durationInputVal = ref('')
-const isDurationFocused = ref(false)
-
-const displayDuration = computed(() => {
-  if (isDurationFocused.value) return durationInputVal.value
-  return currentDuration.value.toString()
-})
-
-const onDurationFocus = () => {
-  isDurationFocused.value = true
-  durationInputVal.value = currentDuration.value.toString()
-}
-
-const onDurationBlur = () => {
-  isDurationFocused.value = false
-  let val = parseInt(durationInputVal.value, 10)
-  if (isNaN(val) || val < 50) val = 50
-  if (val > 20000) val = 20000
-  if (activePreset.value) {
-    updatePresetEffect(activePreset.value.id, { duration: val })
-  }
-}
-
-const onDurationInput = (e: Event) => {
-  const target = e.target as HTMLInputElement
-  durationInputVal.value = target.value
-  const val = parseInt(target.value, 10)
-  if (!isNaN(val) && val >= 50 && val <= 20000 && activePreset.value) {
-    updatePresetEffect(activePreset.value.id, { duration: val })
-  }
-}
-
-const onDurationKeydown = (e: KeyboardEvent) => {
-  if (e.key === 'Enter') {
-    (e.target as HTMLInputElement).blur()
-  } else if (e.key === 'ArrowUp') {
-    e.preventDefault()
-    changeDuration(50)
-  } else if (e.key === 'ArrowDown') {
-    e.preventDefault()
-    changeDuration(-50)
-  }
-}
-
-const changeRepeat = (delta: number) => {
-  if (!activePreset.value) return
-  let next = currentRepeat.value + delta
-  if (next < 1) next = 1
-  if (next > 99) next = 99
-  updatePresetEffect(activePreset.value.id, { repeat: next })
-  if (isRepeatFocused.value) {
-    repeatInputVal.value = next.toString()
-  }
-}
-
-const changeDuration = (deltaMs: number) => {
-  if (!activePreset.value) return
-  const next = Math.max(50, Math.min(20000, currentDuration.value + deltaMs))
-  updatePresetEffect(activePreset.value.id, { duration: next })
-  if (isDurationFocused.value) {
-    durationInputVal.value = next.toString()
-  }
-}
-
-// -------------------------------------------------------------
-// 双曲线叠加画框 (亮度曲线 + 颜色曲线在同一个坐标系叠加)
-// -------------------------------------------------------------
-const curveCanvasRef = ref<HTMLCanvasElement | null>(null)
-const canvasViewportRef = ref<HTMLDivElement | null>(null)
-
-// 曲线内边距
-const padLeft = 38
-const padRight = 16
-const padTop = 16
-const padBottom = 24
-
-// 正在拖拽的节点信息
-const activeDragPoint = ref<{ type: 'brightness' | 'color', index: number } | null>(null)
-const hoveredPoint = ref<{ type: 'brightness' | 'color', index: number } | null>(null)
-
-// 坐标映射
-const toScreenX = (nx: number, w: number) => {
-  const innerW = Math.max(10, w - padLeft - padRight)
-  return padLeft + nx * innerW
-}
-
-const toScreenY = (ny: number, h: number) => {
-  const innerH = Math.max(10, h - padTop - padBottom)
-  return padTop + (1 - ny) * innerH
-}
-
-const toNormX = (sx: number, w: number) => {
-  const innerW = Math.max(10, w - padLeft - padRight)
-  return Math.max(0, Math.min(1, (sx - padLeft) / innerW))
-}
-
-const toNormY = (sy: number, h: number) => {
-  const innerH = Math.max(10, h - padTop - padBottom)
-  return Math.max(0, Math.min(1, 1 - (sy - padTop) / innerH))
-}
-
-// 线性折线插值求值 (点与点之间直线相连，不进行平滑连接)
-const evaluateCurveY = (nx: number, pts: Array<{ x: number, y: number }>): number => {
-  if (pts.length === 0) return 0.5
-  const firstPoint = pts[0]
-  if (!firstPoint) return 0.5
-  if (pts.length === 1) return firstPoint.y
-  if (nx <= firstPoint.x) return firstPoint.y
-
-  const lastPoint = pts[pts.length - 1]
-  if (!lastPoint) return firstPoint.y
-  if (nx >= lastPoint.x) return lastPoint.y
-
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p1 = pts[i]
-    const p2 = pts[i + 1]
-    if (!p1 || !p2) continue
-
-    if (nx >= p1.x && nx <= p2.x) {
-      if (p2.x === p1.x) return p1.y
-      const t = (nx - p1.x) / (p2.x - p1.x)
-      return p1.y + t * (p2.y - p1.y)
-    }
-  }
-  return lastPoint.y
-}
-
-// 主题色常量 (亮度曲线)
-const THEME_CURVE_COLOR = '#a8c7fa'
-
-// 绘制双曲线主画布 (亮度曲线与颜色曲线直接叠加在同一个画框内)
-const drawCurve = () => {
-  const canvas = curveCanvasRef.value
-  const viewport = canvasViewportRef.value
-  if (!canvas || !viewport) return
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
-
-  const rect = viewport.getBoundingClientRect()
-  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
-  const w = rect.width
-  const h = rect.height
-
-  if (w <= 0 || h <= 0) return
-
-  canvas.width = w * dpr
-  canvas.height = h * dpr
-  ctx.resetTransform()
-  ctx.scale(dpr, dpr)
-
-  const innerW = w - padLeft - padRight
-  const innerH = h - padTop - padBottom
-
-  // 1. 背景底色 (深黑工程底色)
-  ctx.fillStyle = '#13161c'
-  ctx.fillRect(0, 0, w, h)
-
-  // 2. 绘制工程坐标网格与标尺
-  const yDivisions = [0, 0.25, 0.5, 0.75, 1.0]
-  ctx.font = '9px "Google Sans", sans-serif'
-  ctx.textAlign = 'right'
-  ctx.textBaseline = 'middle'
-
-  for (const ny of yDivisions) {
-    const sy = toScreenY(ny, h)
-    ctx.beginPath()
-    ctx.moveTo(padLeft, sy)
-    ctx.lineTo(padLeft + innerW, sy)
-    if (ny === 0) {
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)'
-      ctx.lineWidth = 1.5
-    } else if (ny === 1.0) {
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)'
-      ctx.lineWidth = 1
-    } else {
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)'
-      ctx.lineWidth = 1
-    }
-    ctx.stroke()
-
-    // 刻度文字 (0% ~ 100%)
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.4)'
-    ctx.fillText(`${Math.round(ny * 100)}%`, padLeft - 6, sy)
-  }
-
-  // 垂直时间刻度线
-  const durMs = currentDuration.value
-  const xDivisions = [0, 0.25, 0.5, 0.75, 1.0]
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'top'
-
-  for (const nx of xDivisions) {
-    const sx = toScreenX(nx, w)
-    ctx.beginPath()
-    ctx.moveTo(sx, padTop)
-    ctx.lineTo(sx, padTop + innerH)
-    ctx.strokeStyle = nx === 0 || nx === 1.0 ? 'rgba(255, 255, 255, 0.15)' : 'rgba(255, 255, 255, 0.06)'
-    ctx.lineWidth = 1
-    ctx.stroke()
-
-    // 时间刻度文字
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.4)'
-    const timeLabel = Math.round(nx * durMs) + 'ms'
-    ctx.fillText(timeLabel, sx, padTop + innerH + 5)
-  }
-
-  const bPts = currentPoints.value
-  const cPts = currentColorPoints.value
-  const samples = Math.max(120, Math.floor(innerW))
-  const sampleStep = 1 / samples
-
-  // -----------------------------------------------------------
-  // 3. 绘制亮度曲线 (Theme Curve, 折线连接，不平滑)
-  // -----------------------------------------------------------
-  const isBrightnessActive = activeCurveType.value === 'brightness'
-
-  // 亮度曲线下方填充
-  ctx.save()
-  ctx.beginPath()
-  ctx.moveTo(toScreenX(0, w), toScreenY(0, h))
-  ctx.lineTo(toScreenX(0, w), toScreenY(evaluateCurveY(0, bPts), h))
-  for (const p of bPts) {
-    ctx.lineTo(toScreenX(p.x, w), toScreenY(p.y, h))
-  }
-  ctx.lineTo(toScreenX(1, w), toScreenY(evaluateCurveY(1, bPts), h))
-  ctx.lineTo(toScreenX(1, w), toScreenY(0, h))
-  ctx.closePath()
-  ctx.fillStyle = isBrightnessActive ? 'rgba(168, 199, 250, 0.12)' : 'rgba(168, 199, 250, 0.02)'
-  ctx.fill()
-  ctx.restore()
-
-  // 亮度曲线线条 (直线段相连，不平滑；选中高亮时加粗发光，非选中时淡化弱化)
-  ctx.save()
-  ctx.beginPath()
-  ctx.moveTo(toScreenX(0, w), toScreenY(evaluateCurveY(0, bPts), h))
-  for (const p of bPts) {
-    ctx.lineTo(toScreenX(p.x, w), toScreenY(p.y, h))
-  }
-  ctx.lineTo(toScreenX(1, w), toScreenY(evaluateCurveY(1, bPts), h))
-  ctx.strokeStyle = isBrightnessActive ? THEME_CURVE_COLOR : 'rgba(168, 199, 250, 0.35)'
-  ctx.lineWidth = isBrightnessActive ? 2.5 : 1.4
-  ctx.globalAlpha = isBrightnessActive ? 1.0 : 0.38
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  if (isBrightnessActive) {
-    ctx.shadowColor = 'rgba(168, 199, 250, 0.45)'
-    ctx.shadowBlur = 6
-  }
-  ctx.stroke()
-  ctx.restore()
-
-  // 亮度曲线控制节点
-  for (let i = 0; i < bPts.length; i++) {
-    const p = bPts[i]
-    if (!p) continue
-
-    const sx = toScreenX(p.x, w)
-    const sy = toScreenY(p.y, h)
-    const isHovered = isBrightnessActive && hoveredPoint.value?.type === 'brightness' && hoveredPoint.value.index === i
-    const isDragging = isBrightnessActive && activeDragPoint.value?.type === 'brightness' && activeDragPoint.value.index === i
-
-    ctx.save()
-    ctx.globalAlpha = isBrightnessActive ? 1.0 : 0.38
-    ctx.beginPath()
-    const radius = isDragging ? 5.5 : (isHovered ? 5 : (isBrightnessActive ? 3.8 : 2.6))
-    ctx.arc(sx, sy, radius, 0, Math.PI * 2)
-    ctx.fillStyle = isHovered || isDragging ? '#ffffff' : (isBrightnessActive ? THEME_CURVE_COLOR : 'rgba(168, 199, 250, 0.6)')
-    ctx.fill()
-    ctx.lineWidth = isBrightnessActive ? 1.6 : 1.0
-    ctx.strokeStyle = '#ffffff'
-    ctx.stroke()
-    ctx.restore()
-  }
-
-  // -----------------------------------------------------------
-  // 4. 绘制颜色曲线 (Color Curve, 折线连接，不平滑)
-  // -----------------------------------------------------------
-  const isColorActive = activeCurveType.value === 'color'
-
-  // 创建横跨颜色曲线的连续彩色渐变笔刷 (依 Y 轴色彩程度计算描边明暗)
-  const colorGrad = ctx.createLinearGradient(padLeft, 0, padLeft + innerW, 0)
-  for (const cp of cPts) {
-    const nodeRgb = hexToRgb(cp.color)
-    const degree = typeof cp.y === 'number' ? Math.max(0, Math.min(1, cp.y)) : 1.0
-    const gradColor = rgbToHex(
-      Math.round(nodeRgb.r * degree),
-      Math.round(nodeRgb.g * degree),
-      Math.round(nodeRgb.b * degree)
-    )
-    colorGrad.addColorStop(Math.max(0, Math.min(1, cp.x)), gradColor)
-  }
-
-  // 颜色曲线下方微量彩色填充
-  ctx.save()
-  ctx.beginPath()
-  ctx.moveTo(toScreenX(0, w), toScreenY(0, h))
-  ctx.lineTo(toScreenX(0, w), toScreenY(evaluateCurveY(0, cPts), h))
-  for (const cp of cPts) {
-    ctx.lineTo(toScreenX(cp.x, w), toScreenY(cp.y, h))
-  }
-  ctx.lineTo(toScreenX(1, w), toScreenY(evaluateCurveY(1, cPts), h))
-  ctx.lineTo(toScreenX(1, w), toScreenY(0, h))
-  ctx.closePath()
-  ctx.fillStyle = isColorActive ? 'rgba(255, 255, 255, 0.06)' : 'rgba(255, 255, 255, 0.015)'
-  ctx.fill()
-  ctx.restore()
-
-  // 颜色曲线主线条 (全彩渐变色折线描边，直线相连，不平滑；选中高亮时加粗发光，非选中时淡化弱化)
-  ctx.save()
-  ctx.beginPath()
-  ctx.moveTo(toScreenX(0, w), toScreenY(evaluateCurveY(0, cPts), h))
-  for (const cp of cPts) {
-    ctx.lineTo(toScreenX(cp.x, w), toScreenY(cp.y, h))
-  }
-  ctx.lineTo(toScreenX(1, w), toScreenY(evaluateCurveY(1, cPts), h))
-  ctx.strokeStyle = colorGrad
-  ctx.lineWidth = isColorActive ? 3.0 : 1.5
-  ctx.globalAlpha = isColorActive ? 1.0 : 0.35
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  if (isColorActive) {
-    ctx.shadowColor = 'rgba(255, 255, 255, 0.3)'
-    ctx.shadowBlur = 6
-  }
-  ctx.stroke()
-  ctx.restore()
-
-  // 颜色曲线节点
-  for (let i = 0; i < cPts.length; i++) {
-    const cp = cPts[i]
-    if (!cp) continue
-
-    const sx = toScreenX(cp.x, w)
-    const sy = toScreenY(cp.y, h)
-    const isSelected = isColorActive && selectedColorNodeIndex.value === i
-    const isHovered = isColorActive && hoveredPoint.value?.type === 'color' && hoveredPoint.value.index === i
-    const isDragging = isColorActive && activeDragPoint.value?.type === 'color' && activeDragPoint.value.index === i
-
-    ctx.save()
-    ctx.globalAlpha = isColorActive ? 1.0 : 0.35
-
-    // 选中光环 (仅当处于激活状态时)
-    if (isSelected || isDragging) {
-      ctx.beginPath()
-      ctx.arc(sx, sy, 9, 0, Math.PI * 2)
-      ctx.strokeStyle = '#ffffff'
-      ctx.lineWidth = 2.0
-      ctx.stroke()
-    }
-
-    // 节点实心彩色圆球
-    ctx.beginPath()
-    const radius = isColorActive
-      ? (isSelected || isDragging ? 6.5 : (isHovered ? 6 : 4.8))
-      : 3.2
-    ctx.arc(sx, sy, radius, 0, Math.PI * 2)
-    const nodeRgb = hexToRgb(cp.color)
-    const degree = typeof cp.y === 'number' ? Math.max(0, Math.min(1, cp.y)) : 1.0
-    ctx.fillStyle = rgbToHex(
-      Math.round(nodeRgb.r * degree),
-      Math.round(nodeRgb.g * degree),
-      Math.round(nodeRgb.b * degree)
-    )
-    ctx.fill()
-    ctx.lineWidth = isColorActive ? 1.8 : 1.0
-    ctx.strokeStyle = '#ffffff'
-    ctx.stroke()
-
-    ctx.restore()
-  }
-
-  // -----------------------------------------------------------
-  // 5. 预览播放进度填充 (自左向右淡主题色填充，带进出平滑渐变动画)
-  // -----------------------------------------------------------
-  const renderScanFill = (prog: number, alpha: number) => {
-    if (alpha <= 0 || prog <= 0) return
-    const scanX = toScreenX(prog, w)
-    if (scanX <= padLeft) return
-
-    ctx.save()
-    ctx.beginPath()
-    ctx.rect(padLeft, padTop, innerW, innerH)
-    ctx.clip()
-
-    const a0 = (0.04 * alpha).toFixed(4)
-    const a1 = (0.14 * alpha).toFixed(4)
-    const fillGrad = ctx.createLinearGradient(padLeft, 0, scanX, 0)
-    fillGrad.addColorStop(0, `rgba(168, 199, 250, ${a0})`)
-    fillGrad.addColorStop(1, `rgba(168, 199, 250, ${a1})`)
-    ctx.fillStyle = fillGrad
-    ctx.fillRect(padLeft, padTop, scanX - padLeft, innerH)
-    ctx.restore()
-  }
-
-  // 1) 绘制正在渐变消退的历史填充层 (重复按下发送时，前一个填充带平滑渐变消失动画)
-  for (const f of fadingFills.value) {
-    renderScanFill(f.progress, f.alpha)
-  }
-
-  // 2) 绘制当前正在进行的扫描填充
-  if (fillAlpha.value > 0 && (isPlaying.value || playProgress.value > 0)) {
-    renderScanFill(playProgress.value, fillAlpha.value)
-  }
-}
-
-// 根据 X 进度获取无程度加权的基底色彩
-const getBaseColorAtX = (colorPoints: PresetColorPoint[], x: number, fallback: string): string => {
-  if (!colorPoints || colorPoints.length === 0) return fallback
-  if (colorPoints.length === 1) return colorPoints[0]?.color ?? fallback
-  const sorted = [...colorPoints].sort((a, b) => a.x - b.x)
-  const firstPoint = sorted[0]
-  const lastPoint = sorted[sorted.length - 1]
-  if (!firstPoint || !lastPoint) return fallback
-  if (x <= firstPoint.x) return firstPoint.color
-  if (x >= lastPoint.x) return lastPoint.color
-
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const cp1 = sorted[i]
-    const cp2 = sorted[i + 1]
-    if (!cp1 || !cp2) continue
-
-    if (x >= cp1.x && x <= cp2.x) {
-      const span = cp2.x - cp1.x
-      if (span <= 0.0001) return cp1.color
-      const t = (x - cp1.x) / span
-      const rgb1 = hexToRgb(cp1.color)
-      const rgb2 = hexToRgb(cp2.color)
-      const r = Math.round(rgb1.r + t * (rgb2.r - rgb1.r))
-      const g = Math.round(rgb1.g + t * (rgb2.g - rgb1.g))
-      const b = Math.round(rgb1.b + t * (rgb2.b - rgb1.b))
-      return rgbToHex(r, g, b)
-    }
-  }
-  return fallback
-}
-
-// -------------------------------------------------------------
-// 曲线画框鼠标交互 (智能感应双曲线节点与点击空白加点)
-// -------------------------------------------------------------
-// 仅在当前选中的曲线类型中查找命中节点（选择哪条曲线，就仅可修改对应的曲线）
-const findNearNode = (sx: number, sy: number, w: number, h: number, threshold = 14) => {
-  if (activeCurveType.value === 'color') {
-    const cPts = currentColorPoints.value
-    for (let i = 0; i < cPts.length; i++) {
-      const point = cPts[i]
-      if (!point) continue
-
-      const px = toScreenX(point.x, w)
-      const py = toScreenY(point.y, h)
-      if (Math.hypot(px - sx, py - sy) <= threshold) {
-        return { type: 'color' as const, index: i }
-      }
-    }
-  } else {
-    const bPts = currentPoints.value
-    for (let i = 0; i < bPts.length; i++) {
-      const point = bPts[i]
-      if (!point) continue
-
-      const px = toScreenX(point.x, w)
-      const py = toScreenY(point.y, h)
-      if (Math.hypot(px - sx, py - sy) <= threshold) {
-        return { type: 'brightness' as const, index: i }
-      }
-    }
-  }
-  return null
-}
-
-const stopCanvasDrag = () => {
-  activeDragPoint.value = null
-  if (typeof window !== 'undefined') {
-    window.removeEventListener('pointermove', onGlobalPointerMove)
-    window.removeEventListener('pointerup', onGlobalPointerUp)
-    window.removeEventListener('pointercancel', onGlobalPointerUp)
-    window.removeEventListener('blur', stopCanvasDrag)
-  }
-  drawCurve()
-}
-
-const onGlobalPointerMove = (e: PointerEvent) => {
-  if (e.buttons === 0) {
-    stopCanvasDrag()
-    return
-  }
-  onCanvasPointerMove(e)
-}
-
-const onGlobalPointerUp = (e: PointerEvent) => {
-  try {
-    ;(e.target as HTMLElement)?.releasePointerCapture?.(e.pointerId)
-  } catch {}
-  stopCanvasDrag()
-}
-
-const onCanvasPointerDown = (e: PointerEvent) => {
-  if (e.button !== 0) return // 只响应鼠标主键 (左键)
-  const viewport = canvasViewportRef.value
-  if (!viewport || !activePreset.value) return
-  const rect = viewport.getBoundingClientRect()
-  const sx = e.clientX - rect.left
-  const sy = e.clientY - rect.top
-  const w = rect.width
-  const h = rect.height
-
-  try {
-    ;(e.target as HTMLElement)?.setPointerCapture?.(e.pointerId)
-  } catch {}
-
-  if (typeof window !== 'undefined') {
-    window.addEventListener('pointermove', onGlobalPointerMove)
-    window.addEventListener('pointerup', onGlobalPointerUp)
-    window.addEventListener('pointercancel', onGlobalPointerUp)
-    window.addEventListener('blur', stopCanvasDrag)
-  }
-
-  const hit = findNearNode(sx, sy, w, h)
-
-  // 1. 鼠标选择模式 (默认安全模式：仅查看与选中节点，严禁修改曲线，避免误操作)
-  if (activeEditTool.value === 'pointer') {
-    if (hit) {
-      if (hit.type === 'color') {
-        selectedColorNodeIndex.value = hit.index
-      } else {
-        selectedColorNodeIndex.value = null
-      }
-    } else {
-      selectedColorNodeIndex.value = null
-    }
-    drawCurve()
-    return
-  }
-
-  // 2. 笔/调节模式 (只允许拖拽调整已有节点，禁止点击空白处新增节点)
-  if (activeEditTool.value === 'pen') {
-    if (hit) {
-      activeDragPoint.value = hit
-      if (hit.type === 'color') {
-        selectedColorNodeIndex.value = hit.index
-      } else {
-        selectedColorNodeIndex.value = null
-      }
-      drawCurve()
-    }
-    return
-  }
-
-  // 3. 添加节点模式 (点击曲线空白处新增关键节点)
-  if (activeEditTool.value === 'add') {
-    if (hit) {
-      // 若正好点击在现有节点上，选中并允许直接微调
-      activeDragPoint.value = hit
-      if (hit.type === 'color') {
-        selectedColorNodeIndex.value = hit.index
-      }
-      drawCurve()
-      return
-    }
-
-    const nx = toNormX(sx, w)
-    const ny = toNormY(sy, h)
-
-    if (activeCurveType.value === 'brightness') {
-      const newPts = [...currentPoints.value, { x: nx, y: ny }].sort((a, b) => a.x - b.x)
-      updatePresetEffect(activePreset.value.id, { points: newPts })
-      const idx = newPts.findIndex(p => Math.abs(p.x - nx) < 0.001 && Math.abs(p.y - ny) < 0.001)
-      activeDragPoint.value = { type: 'brightness', index: idx }
-      drawCurve()
-    } else {
-      const baseHex = getBaseColorAtX(currentColorPoints.value, nx, currentColor.value)
-      const newPts = [...currentColorPoints.value, { x: nx, y: ny, color: baseHex }].sort((a, b) => a.x - b.x)
-      updatePresetEffect(activePreset.value.id, { colorPoints: newPts })
-      const idx = newPts.findIndex(p => Math.abs(p.x - nx) < 0.001)
-      selectedColorNodeIndex.value = idx
-      activeDragPoint.value = { type: 'color', index: idx }
-      drawCurve()
-    }
-    return
-  }
-
-  // 4. 删除节点模式 (点击中间关键节点直接删除)
-  if (activeEditTool.value === 'delete') {
-    if (hit) {
-      if (hit.type === 'brightness') {
-        const pts = [...currentPoints.value]
-        if (pts.length > 2 && hit.index > 0 && hit.index < pts.length - 1) {
-          pts.splice(hit.index, 1)
-          updatePresetEffect(activePreset.value.id, { points: pts })
-          drawCurve()
-        }
-      } else {
-        const pts = [...currentColorPoints.value]
-        if (pts.length > 2 && hit.index > 0 && hit.index < pts.length - 1) {
-          pts.splice(hit.index, 1)
-          selectedColorNodeIndex.value = null
-          updatePresetEffect(activePreset.value.id, { colorPoints: pts })
-          drawCurve()
-        }
-      }
-    }
-  }
-}
-
-const onCanvasPointerMove = (e: PointerEvent) => {
-  // 如果处于拖拽状态但鼠标按键已松开，彻底终止拖拽，杜绝粘连
-  if (activeDragPoint.value !== null && e.buttons === 0) {
-    stopCanvasDrag()
-    return
-  }
-
-  const viewport = canvasViewportRef.value
-  if (!viewport || !activePreset.value) return
-  const rect = viewport.getBoundingClientRect()
-  const sx = e.clientX - rect.left
-  const sy = e.clientY - rect.top
-  const w = rect.width
-  const h = rect.height
-
-  // 仅在笔或添加模式下才响应拖拽位移；鼠标与删除模式严禁拖动节点
-  if (activeDragPoint.value !== null && (activeEditTool.value === 'pen' || activeEditTool.value === 'add')) {
-    const nx = toNormX(sx, w)
-    const ny = toNormY(sy, h)
-
-    if (activeDragPoint.value.type === 'brightness') {
-      const pts = [...currentPoints.value]
-      const idx = activeDragPoint.value.index
-      const point = pts[idx]
-      if (!point) return
-
-      point.y = ny
-      if (idx > 0 && idx < pts.length - 1) {
-        const previousPoint = pts[idx - 1]
-        const nextPoint = pts[idx + 1]
-        if (previousPoint && nextPoint) {
-          point.x = Math.max(previousPoint.x + 0.01, Math.min(nextPoint.x - 0.01, nx))
-        }
-      }
-      updatePresetEffect(activePreset.value.id, { points: pts })
-      drawCurve()
-    } else {
-      const pts = [...currentColorPoints.value]
-      const idx = activeDragPoint.value.index
-      const point = pts[idx]
-      if (!point) return
-
-      point.y = ny
-      if (idx > 0 && idx < pts.length - 1) {
-        const previousPoint = pts[idx - 1]
-        const nextPoint = pts[idx + 1]
-        if (previousPoint && nextPoint) {
-          point.x = Math.max(previousPoint.x + 0.01, Math.min(nextPoint.x - 0.01, nx))
-        }
-      }
-      updatePresetEffect(activePreset.value.id, { colorPoints: pts })
-      drawCurve()
-    }
-  } else {
-    hoveredPoint.value = findNearNode(sx, sy, w, h)
-    drawCurve()
-  }
-}
-
-const onCanvasPointerUp = (e: PointerEvent) => {
-  try {
-    ;(e.target as HTMLElement)?.releasePointerCapture?.(e.pointerId)
-  } catch {}
-  stopCanvasDrag()
-}
-
-const onCanvasDblClick = (e: MouseEvent) => {
-  // 仅在删除工具激活时允许删除节点，避免误操作
-  if (activeEditTool.value !== 'delete') return
-
-  const viewport = canvasViewportRef.value
-  if (!viewport || !activePreset.value) return
-  const rect = viewport.getBoundingClientRect()
-  const sx = e.clientX - rect.left
-  const sy = e.clientY - rect.top
-  const hit = findNearNode(sx, sy, rect.width, rect.height)
-  if (hit !== null) {
-    if (hit.type === 'brightness') {
-      const pts = [...currentPoints.value]
-      if (pts.length > 2 && hit.index > 0 && hit.index < pts.length - 1) {
-        pts.splice(hit.index, 1)
-        updatePresetEffect(activePreset.value.id, { points: pts })
-        drawCurve()
-      }
-    } else {
-      const pts = [...currentColorPoints.value]
-      if (pts.length > 2 && hit.index > 0 && hit.index < pts.length - 1) {
-        pts.splice(hit.index, 1)
-        selectedColorNodeIndex.value = null
-        updatePresetEffect(activePreset.value.id, { colorPoints: pts })
-        drawCurve()
-      }
-    }
-  }
-}
-
-const onCanvasContextMenu = (e: MouseEvent) => {
-  e.preventDefault()
-  if (activeEditTool.value !== 'pointer') {
-    onCanvasDblClick(e)
-  }
-}
-
-// -------------------------------------------------------------
-// 曲线模板管理系统 (无预设模板，仅针对当前选中滑块生效)
-// -------------------------------------------------------------
-interface CurveTemplate {
-  id: string
-  name: string
-  type: 'brightness' | 'color'
-  points?: PresetPoint[]
-  colorPoints?: PresetColorPoint[]
-}
-
-const curveTemplates = useState<CurveTemplate[]>('design_curve_templates', () => [])
-
-// 仅获取当前选中滑块类型所对应的模板列表
-const activeCurveTemplates = computed(() => {
-  return curveTemplates.value.filter(t => {
-    const tType = t.type || (t.colorPoints && t.colorPoints.length > 0 ? 'color' : 'brightness')
-    return tType === activeCurveType.value
-  })
-})
-
-const loadCurveTemplates = () => {
-  if (curveTemplates.value.length > 0) return
-  if (typeof window === 'undefined') return
-  try {
-    const raw = localStorage.getItem('lse_curve_templates')
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) {
-        curveTemplates.value = parsed
-        return
-      }
-    }
-  } catch {}
-  curveTemplates.value = []
-}
-
-const saveCurveTemplates = () => {
-  if (typeof window === 'undefined') return
-  try {
-    localStorage.setItem('lse_curve_templates', JSON.stringify(curveTemplates.value))
-  } catch {}
-}
-
-const addCurrentCurveAsTemplate = () => {
-  if (!activePreset.value) return
-  const isBrightness = activeCurveType.value === 'brightness'
-  const sameTypeCount = activeCurveTemplates.value.length + 1
-  const name = isBrightness ? `亮度 ${sameTypeCount}` : `色彩 ${sameTypeCount}`
-
-  const newTmpl: CurveTemplate = {
-    id: 'tmpl-' + Date.now(),
-    name,
-    type: activeCurveType.value,
-    points: isBrightness ? currentPoints.value.map(p => ({ ...p })) : undefined,
-    colorPoints: !isBrightness
-      ? currentColorPoints.value.map(cp => normalizeColorPoint(cp, currentColor.value))
-      : undefined
-  }
-
-  curveTemplates.value.push(newTmpl)
-  saveCurveTemplates()
-}
-
-const applyCurveTemplate = (tmpl: CurveTemplate) => {
-  if (!activePreset.value) return
-
-  // 仅针对当前选中滑块类型的曲线生效
-  if (activeCurveType.value === 'brightness') {
-    if (tmpl.points && tmpl.points.length > 0) {
-      updatePresetEffect(activePreset.value.id, {
-        points: tmpl.points.map(p => ({ ...p }))
-      })
-    }
-  } else if (activeCurveType.value === 'color') {
-    if (tmpl.colorPoints && tmpl.colorPoints.length > 0) {
-      updatePresetEffect(activePreset.value.id, {
-        colorPoints: tmpl.colorPoints.map(cp => normalizeColorPoint(cp, currentColor.value))
-      })
-    }
-  }
-
-  drawCurve()
-}
-
-const removeCurveTemplate = (id: string, e: Event) => {
-  e.stopPropagation()
-  if (editingTemplateId.value === id) {
-    editingTemplateId.value = null
-  }
-  curveTemplates.value = curveTemplates.value.filter(t => t.id !== id)
-  saveCurveTemplates()
-}
-
-// 自定义模板双击重命名
-const editingTemplateId = ref<string | null>(null)
-const editingTemplateName = ref('')
-const templateEditInputRef = ref<HTMLInputElement | null>(null)
-
-const startEditTemplate = (tmpl: CurveTemplate) => {
-  editingTemplateId.value = tmpl.id
-  editingTemplateName.value = tmpl.name
-  nextTick(() => {
-    templateEditInputRef.value?.focus()
-    templateEditInputRef.value?.select()
-  })
-}
-
-const saveEditTemplate = (tmpl: CurveTemplate) => {
-  if (editingTemplateId.value !== tmpl.id) return
-  const trimmed = editingTemplateName.value.trim()
-  if (trimmed) {
-    tmpl.name = trimmed
-    saveCurveTemplates()
-  }
-  editingTemplateId.value = null
-}
-
-const cancelEditTemplate = () => {
-  editingTemplateId.value = null
-}
-
-// -------------------------------------------------------------
-// 预览播放循环联动 (支持进入与退出平滑渐变动画)
-// -------------------------------------------------------------
-let playRafId: number | null = null
-let playStartTime = 0
-let lastLoopTime = 0
-let playbackPausedAt = 0
-let handledPlaySeekVersion = playSeekVersion.value
-
-// 预设效果预览色块更新 (纯净色块实时呈现当前预设的亮度曲线与颜色曲线合成光效)
-const updatePreviewSquare = () => {
-  if (!previewBoxRef.value) return
-
-  if (isPlaying.value || fillAlpha.value > 0) {
-    const prog = playProgress.value
-    const brightness = sampleCurveBrightness(currentPoints.value, prog)
-    const rgb = sampleCurveColor(currentColorPoints.value, prog, currentColor.value)
-    const factor = isPlaying.value ? 1 : fillAlpha.value
-
-    const r = Math.max(0, Math.min(255, Math.round(rgb.r * brightness * factor)))
-    const g = Math.max(0, Math.min(255, Math.round(rgb.g * brightness * factor)))
-    const b = Math.max(0, Math.min(255, Math.round(rgb.b * brightness * factor)))
-
-    previewBoxRef.value.style.backgroundColor = `rgb(${r}, ${g}, ${b})`
-  } else {
-    previewBoxRef.value.style.backgroundColor = '#000000'
-  }
-}
-
-const runPlayLoop = (timestamp: number) => {
-  if (!lastLoopTime) lastLoopTime = timestamp
-  const deltaMs = Math.min(100, timestamp - lastLoopTime)
-  lastLoopTime = timestamp
-
-  // 更新所有消退历史填充层的透明度 (与播放完成后动画相同: 约 220ms 平滑淡出)
-  if (fadingFills.value.length > 0) {
-    for (let i = fadingFills.value.length - 1; i >= 0; i--) {
-      const f = fadingFills.value[i]
-      if (!f) continue
-
-      f.alpha = Math.max(0, f.alpha - deltaMs / 220)
-      if (f.alpha <= 0) {
-        fadingFills.value.splice(i, 1)
-      }
-    }
-  }
-
-  const dur = currentDuration.value
-  const repeat = currentRepeat.value
-
-  if (playSeekVersion.value !== handledPlaySeekVersion) {
-    handledPlaySeekVersion = playSeekVersion.value
-    playProgress.value = Math.max(0, Math.min(1, playSeekProgress.value))
-    if (isPlaying.value) {
-      playStartTime = timestamp - (playProgress.value * dur)
-      if (isPlaybackPaused.value) {
-        playbackPausedAt = performance.now()
-      }
-    }
-  }
-
-  if (isPlaying.value) {
-    fillAlpha.value = 1
-
-    if (!playStartTime) {
-      playStartTime = timestamp - (playProgress.value * dur)
-    }
-
-    if (!isPlaybackPaused.value) {
-      const elapsed = timestamp - playStartTime
-
-      if (repeat > 0 && elapsed >= dur * repeat) {
-        isPlaying.value = false
-        playProgress.value = 1.0 // 保持充满状态以执行平滑退出淡出
-        playStartTime = 0
-      } else {
-        playProgress.value = (elapsed % dur) / dur
-      }
-    }
-  } else {
-    // 退出渐变动画: 约 220ms 平滑淡出
-    if (fillAlpha.value > 0) {
-      fillAlpha.value = Math.max(0, fillAlpha.value - deltaMs / 220)
-    }
-
-    if (fillAlpha.value <= 0 && fadingFills.value.length === 0) {
-      fillAlpha.value = 0
-      playProgress.value = 0
-      if (playRafId) {
-        cancelAnimationFrame(playRafId)
-        playRafId = null
-      }
-      lastLoopTime = 0
-      drawCurve()
-      updatePreviewSquare()
-      return
-    }
-  }
-
-  drawCurve()
-  updatePreviewSquare()
-  playRafId = requestAnimationFrame(runPlayLoop)
-}
-
-watch(
-  () => isPlaybackPaused.value,
-  (paused) => {
-    if (paused) {
-      if (isPlaying.value && playStartTime > 0) {
-        playbackPausedAt = performance.now()
-      }
-      return
-    }
-
-    if (playbackPausedAt > 0 && playStartTime > 0) {
-      playStartTime += performance.now() - playbackPausedAt
-    }
-    playbackPausedAt = 0
-  }
-)
-
-watch(
-  [() => isPlaying.value, () => playTriggerTime.value],
-  ([playing]) => {
-    if (playing) {
-      // 连续按键按下预设/重复触发播放时，前一个扫描填充不直接消失，捕获到渐变消退列表中 (与播放完成后动画相同)
-      if (playProgress.value > 0 && fillAlpha.value > 0) {
-        fadingFills.value.push({
-          progress: playProgress.value,
-          alpha: fillAlpha.value
-        })
-        if (fadingFills.value.length > 6) {
-          fadingFills.value.shift()
-        }
-      }
-
-      playProgress.value = 0
-      fillAlpha.value = 1
-      playStartTime = 0
-      lastLoopTime = 0
-      if (playRafId) cancelAnimationFrame(playRafId)
-      playRafId = requestAnimationFrame(runPlayLoop)
-    } else {
-      if (fillAlpha.value > 0 || fadingFills.value.length > 0) {
-        // 停止时继续保持 RAF 循环以执行平滑退出渐变动画
-        playStartTime = 0
-        lastLoopTime = 0
-        if (!playRafId) {
-          playRafId = requestAnimationFrame(runPlayLoop)
-        }
-      } else {
-        if (playRafId) {
-          cancelAnimationFrame(playRafId)
-          playRafId = null
-        }
-        playProgress.value = 0
-        drawCurve()
-        updatePreviewSquare()
-      }
-    }
-  }
-)
-
-// -------------------------------------------------------------
-// 生命周期与尺寸联动
-// -------------------------------------------------------------
-let resizeObserver: ResizeObserver | null = null
 let timelineResizeObserver: ResizeObserver | null = null
-let curveRevealAnimation: Animation | null = null
-let curvePresetTransitionAnimation: Animation | null = null
-let curvePresetTransitionLayer: HTMLCanvasElement | null = null
-
-const observeCurveCanvas = () => {
-  if (!canvasViewportRef.value || typeof ResizeObserver === 'undefined') return
-
-  resizeObserver?.disconnect()
-  resizeObserver = new ResizeObserver(() => {
-    drawCurve()
-  })
-  resizeObserver.observe(canvasViewportRef.value)
-}
-
-const animateCurveReveal = () => {
-  const canvas = curveCanvasRef.value
-  if (
-    !canvas ||
-    disableAnimations.value ||
-    typeof canvas.animate !== 'function'
-  ) {
-    return
-  }
-
-  curveRevealAnimation?.cancel()
-  curveRevealAnimation = canvas.animate(
-    [
-      { opacity: 0, transform: 'scale(0.985)', transformOrigin: 'center' },
-      { opacity: 1, transform: 'scale(1)', transformOrigin: 'center' }
-    ],
-    {
-      duration: 320,
-      easing: 'cubic-bezier(0.2, 0, 0, 1)'
-    }
-  )
-}
-
-const animateCurveTypeSwitch = () => {
-  const canvas = curveCanvasRef.value
-  if (
-    !canvas ||
-    disableAnimations.value ||
-    typeof canvas.animate !== 'function'
-  ) {
-    return
-  }
-
-  canvas.getAnimations().forEach((animation) => {
-    if (animation.id === 'curve-type-switch') {
-      animation.cancel()
-    }
-  })
-  canvas.animate(
-    [
-      { opacity: 0.35 },
-      { opacity: 1 }
-    ],
-    {
-      id: 'curve-type-switch',
-      duration: 260,
-      easing: 'cubic-bezier(0.2, 0, 0, 1)'
-    }
-  )
-}
-
-const removeCurvePresetTransition = () => {
-  curvePresetTransitionAnimation?.cancel()
-  curvePresetTransitionAnimation = null
-  curvePresetTransitionLayer?.remove()
-  curvePresetTransitionLayer = null
-}
-
-const captureCurveFrame = () => {
-  const canvas = curveCanvasRef.value
-  if (!canvas || canvas.width <= 0 || canvas.height <= 0) return null
-
-  const snapshot = document.createElement('canvas')
-  snapshot.width = canvas.width
-  snapshot.height = canvas.height
-  const snapshotContext = snapshot.getContext('2d')
-  if (!snapshotContext) return null
-
-  snapshotContext.drawImage(canvas, 0, 0)
-  return snapshot
-}
-
-const animateCurvePresetSwitch = (snapshot: HTMLCanvasElement | null) => {
-  const viewport = canvasViewportRef.value
-  removeCurvePresetTransition()
-
-  if (
-    !snapshot ||
-    !viewport ||
-    disableAnimations.value ||
-    typeof snapshot.animate !== 'function'
-  ) {
-    return
-  }
-
-  Object.assign(snapshot.style, {
-    position: 'absolute',
-    top: '0',
-    right: '0',
-    bottom: '0',
-    left: '0',
-    width: '100%',
-    height: '100%',
-    display: 'block',
-    pointerEvents: 'none',
-    zIndex: '2',
-    willChange: 'opacity'
-  })
-  viewport.appendChild(snapshot)
-  curvePresetTransitionLayer = snapshot
-
-  const animation = snapshot.animate(
-    [
-      { opacity: 1 },
-      { opacity: 0 }
-    ],
-    {
-      duration: 160,
-      easing: 'cubic-bezier(0.2, 0, 0, 1)',
-      fill: 'forwards'
-    }
-  )
-  curvePresetTransitionAnimation = animation
-  animation.finished
-    .then(() => {
-      if (curvePresetTransitionLayer === snapshot) {
-        snapshot.remove()
-        curvePresetTransitionLayer = null
-        curvePresetTransitionAnimation = null
-      }
-    })
-    .catch(() => {})
-}
-
-const refreshCurveCanvas = () => {
-  nextTick(() => {
-    requestAnimationFrame(() => {
-      if (designViewMode.value === 'timeline' || !showDesignWorkspace.value) {
-        return
-      }
-      observeCurveCanvas()
-      drawCurve()
-      updatePreviewSquare()
-      animateCurveReveal()
-    })
-  })
-}
 
 const observeTimelineViewport = () => {
   const viewport = timelineScrollRef.value
@@ -4604,99 +5315,50 @@ watch(workspaceRestoreVersion, () => {
 })
 
 const handleDesignWorkspaceAfterEnter = () => {
-  if (designViewMode.value !== 'timeline') {
-    refreshCurveCanvas()
-    return
-  }
-  if (timelineEventId.value === null) {
-    return
-  }
+  if (timelineEventId.value === null) return
   observeTimelineViewport()
 }
 
-watch(
-  () => currentColor.value,
-  () => {
-    drawCurve()
-  },
-  { immediate: true }
-)
-
-watch(
-  () => activePreset.value?.id,
-  (presetId, previousPresetId) => {
-    const shouldAnimateCurveSwitch =
-      presetId !== null &&
-      previousPresetId !== null &&
-      presetId !== previousPresetId
-    const curveSnapshot = shouldAnimateCurveSwitch
-      ? captureCurveFrame()
-      : null
-
-    selectedColorNodeIndex.value = null
-    // 保留 fadingFills，连续按键切换预设时的消退动画能平滑过渡，不直接闪断消失
-    nextTick(() => {
-      drawCurve()
-      updatePreviewSquare()
-      if (shouldAnimateCurveSwitch) {
-        animateDesignTargetSwitch(designViewRef.value)
-        animateCurvePresetSwitch(curveSnapshot)
-      } else {
-        removeCurvePresetTransition()
-      }
-    })
-  },
-  { flush: 'sync' }
-)
-
 watch(selectedEventId, (eventId, previousEventId) => {
+  if (eventId !== previousEventId) {
+    cancelTimelineClipFillDrag()
+    closeTimelineContextMenu()
+    selectedTimelineTriggerIds.value = []
+    timelineMarqueeRect.value = null
+  }
   timelineEventId.value = eventId
 
-  if (timelineEventId.value !== null) {
-    resizeObserver?.disconnect()
-    resizeObserver = null
-    nextTick(() => {
-      if (timelineTracksViewportRef.value) {
-        timelineTracksViewportRef.value.scrollTop = 0
-      }
-      observeTimelineViewport()
-      scheduleTimelineWaveformDraw()
-      scheduleTimelineVerticalScrollbarUpdate()
-      if (
-        designViewMode.value === 'timeline' &&
-        eventId !== null &&
-        previousEventId !== null &&
-        eventId !== previousEventId
-      ) {
-        animateDesignTargetSwitch(timelineEditorRef.value)
-        animateDesignTargetSwitch(timelineThumbnailStripRef.value)
-        animateDesignTargetSwitch(timelineWaveformCanvasRef.value)
-        animateTimelineTracksReveal()
-      }
-    })
+  if (eventId === null) {
+    timelineResizeObserver?.disconnect()
+    timelineResizeObserver = null
+    clearTimelineThumbnails()
+    clearTimelineWaveform()
     return
   }
 
-  timelineResizeObserver?.disconnect()
-  timelineResizeObserver = null
   nextTick(() => {
-    drawCurve()
-    updatePreviewSquare()
-    observeCurveCanvas()
+    if (timelineTracksViewportRef.value) {
+      timelineTracksViewportRef.value.scrollTop = 0
+    }
+    observeTimelineViewport()
+    scheduleTimelineWaveformDraw()
+    scheduleTimelineVerticalScrollbarUpdate()
+    if (previousEventId !== null && eventId !== previousEventId) {
+      animateDesignTargetSwitch(timelineEditorRef.value)
+      animateDesignTargetSwitch(timelineThumbnailStripRef.value)
+      animateDesignTargetSwitch(timelineWaveformLayerRef.value)
+      animateTimelineTracksReveal()
+    }
   })
 })
 
-watch(designViewMode, (mode, previousMode) => {
-  if (mode !== 'timeline' || previousMode === 'timeline') return
-  nextTick(animateTimelineTracksReveal)
-}, { flush: 'post' })
-
-// 监听滑块切换曲线类型：滑块选中对应曲线时即刻高亮对应曲线，清除节点残留拾取与悬浮态
-watch(activeCurveType, () => {
-  selectedColorNodeIndex.value = null
-  hoveredPoint.value = null
-  drawCurve()
-  animateCurveTypeSwitch()
+watch(timelinePresetItems, (items) => {
+  const availableTriggerIds = new Set(
+    items.map(item => item.playback.triggerId)
+  )
+  selectedTimelineTriggerIds.value = selectedTimelineTriggerIds.value.filter(
+    triggerId => availableTriggerIds.has(triggerId)
+  )
 })
 
 watch(
@@ -4705,19 +5367,23 @@ watch(
     videoDuration.value,
     timelineThumbnailCount.value,
     timelineEventId.value,
-    timelineRangeStart.value,
-    timelineRangeDuration.value
+    timelineCommittedRangeStart.value,
+    timelineCommittedRangeDuration.value
   ] as const,
   ([source, duration, thumbnailCount, eventId, rangeStart, rangeDuration]) => {
-    if (
-      !source ||
-      duration <= 0
-    ) {
+    if (!source || duration <= 0) {
+      resetTimelineThumbnailCache()
       clearTimelineThumbnails()
       return
     }
 
-    if (eventId === null || rangeDuration <= 0 || rangeStart < 0) return
+    if (timelineThumbnailCacheSource !== source) {
+      resetTimelineThumbnailCache(source)
+    }
+    if (eventId === null || rangeDuration <= 0 || rangeStart < 0) {
+      clearTimelineThumbnails()
+      return
+    }
     if (thumbnailCount <= 0) {
       clearTimelineThumbnails()
       return
@@ -4729,7 +5395,7 @@ watch(
 )
 
 watch(
-  [timelineRangeStart, timelineRangeDuration],
+  [timelineCommittedRangeStart, timelineCommittedRangeDuration],
   () => {
     nextTick(() => {
       scheduleTimelineWaveformDraw()
@@ -4748,14 +5414,9 @@ watch(
 
 watch(
   [
-    () => playingEventId.value,
-    () => playingEventTriggerId.value,
-    () => eventPlayProgress.value,
     () => videoCurrentTime.value,
     () => timelineVideoPosition.value,
-    () => timelinePixelWidth.value,
-    () => designViewMode.value,
-    timelinePresetItems
+    () => timelinePixelWidth.value
   ],
   scheduleTimelinePlaybackProgressRender,
   { flush: 'post' }
@@ -4766,11 +5427,19 @@ watch(
     () => videoSrc.value,
     () => videoDuration.value,
     () => timelineEventId.value,
-    timelineRangeStart,
-    timelineRangeDuration
+    timelineCommittedRangeStart,
+    timelineCommittedRangeDuration
   ],
   ([source, duration, eventId]) => {
-    if (!source || duration <= 0 || eventId === null) {
+    if (!source || duration <= 0) {
+      resetTimelineWaveformCache()
+      clearTimelineWaveform()
+      return
+    }
+    if (timelineWaveformCacheSource !== source) {
+      resetTimelineWaveformCache(source)
+    }
+    if (eventId === null) {
       clearTimelineWaveform()
       return
     }
@@ -4781,36 +5450,62 @@ watch(
 )
 
 onMounted(() => {
-  loadHistoryColors()
-  loadCurveTemplates()
+  window.addEventListener('keydown', handleTimelineKeydown, true)
+  window.addEventListener(
+    'pointerdown',
+    handleTimelineContextMenuPointerDown,
+    true
+  )
+  window.addEventListener('blur', closeTimelineContextMenu)
   window.addEventListener('pointermove', handleTimelinePointerMove, true)
   window.addEventListener('pointerup', handleTimelinePointerUp, true)
   window.addEventListener('pointercancel', handleTimelinePointerUp, true)
+  window.addEventListener('pointerup', handleTimelineClipFillPointerUp, true)
+  window.addEventListener(
+    'pointercancel',
+    handleTimelineClipFillPointerCancel,
+    true
+  )
+  window.addEventListener(
+    'lostpointercapture',
+    handleTimelineClipFillPointerLostCapture,
+    true
+  )
   nextTick(() => {
-    drawCurve()
-    updatePreviewSquare()
-    observeCurveCanvas()
     scheduleTimelinePlaybackProgressRender()
     if (timelineEventId.value !== null) {
       observeTimelineViewport()
     }
     restoreTimelineViewportState()
   })
-  refreshCurveCanvas()
 })
 
 onUnmounted(() => {
-  stopCanvasDrag()
+  cancelTimelineClipFillDrag()
+  clearTimelineNativeDragImage()
   clearTimelineThumbnails()
   clearTimelineWaveform()
-  removeCurvePresetTransition()
+  window.removeEventListener('keydown', handleTimelineKeydown, true)
+  window.removeEventListener(
+    'pointerdown',
+    handleTimelineContextMenuPointerDown,
+    true
+  )
+  window.removeEventListener('blur', closeTimelineContextMenu)
   window.removeEventListener('pointermove', handleTimelinePointerMove, true)
   window.removeEventListener('pointerup', handleTimelinePointerUp, true)
   window.removeEventListener('pointercancel', handleTimelinePointerUp, true)
-  if (playRafId) {
-    cancelAnimationFrame(playRafId)
-    playRafId = null
-  }
+  window.removeEventListener('pointerup', handleTimelineClipFillPointerUp, true)
+  window.removeEventListener(
+    'pointercancel',
+    handleTimelineClipFillPointerCancel,
+    true
+  )
+  window.removeEventListener(
+    'lostpointercapture',
+    handleTimelineClipFillPointerLostCapture,
+    true
+  )
   if (timelineWaveformDrawRafId) {
     cancelAnimationFrame(timelineWaveformDrawRafId)
     timelineWaveformDrawRafId = 0
@@ -4819,28 +5514,17 @@ onUnmounted(() => {
     cancelAnimationFrame(timelineProgressRenderRafId)
     timelineProgressRenderRafId = null
   }
-  curveRevealAnimation?.cancel()
-  curveRevealAnimation = null
-  timelineClipProgressRefs.clear()
+  timelineMarqueeRect.value = null
   if (timelineDropAnimationTimer) {
     clearTimeout(timelineDropAnimationTimer)
     timelineDropAnimationTimer = null
   }
   clearTimelineScrollbarHideTimer()
   clearTimelineVerticalScrollbarHideTimer()
-  if (resizeObserver) {
-    resizeObserver.disconnect()
-    resizeObserver = null
-  }
   if (timelineResizeObserver) {
     timelineResizeObserver.disconnect()
     timelineResizeObserver = null
   }
-})
-
-defineExpose({
-  pickScreenColor,
-  setColor
 })
 </script>
 
@@ -4851,700 +5535,438 @@ defineExpose({
       mode="out-in"
       @after-enter="handleDesignWorkspaceAfterEnter"
     >
-      <!-- 没有可展示的设计目标时展示空态引导 -->
       <div v-if="!showDesignWorkspace" key="design-ready" class="design-empty-state">
-      <svg class="empty-icon" viewBox="0 0 24 24" fill="currentColor">
-        <path
-          d="m16.24 11.51 1.57-1.57-3.75-3.75-1.57 1.57-4.14-4.13c-.78-.78-2.05-.78-2.83 0l-1.9 1.9c-.78.78-.78 2.05 0 2.83l4.13 4.13L3 17.25V21h3.75l4.76-4.76 4.13 4.13c.95.95 2.23.6 2.83 0l1.9-1.9c.78-.78.78-2.05 0-2.83l-4.13-4.13zm-7.06-.44L5.04 6.94l1.89-1.9L8.2 6.31 7.02 7.5l1.41 1.41 1.19-1.19 1.45 1.45-1.89 1.9zm7.88 7.89-4.13-4.13 1.9-1.9 1.45 1.45-1.19 1.19 1.41 1.41 1.19-1.19 1.27 1.27-1.9 1.9zm3.65-11.92a.996.996 0 0 0 0-1.41l-2.34-2.34c-.47-.47-1.12-.29-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"
-        />
-      </svg>
-      <span class="empty-title">未选中预设或事件</span>
-    </div>
+        <svg class="empty-icon" viewBox="0 0 24 24" fill="currentColor">
+          <path
+            d="m16.24 11.51 1.57-1.57-3.75-3.75-1.57 1.57-4.14-4.13c-.78-.78-2.05-.78-2.83 0l-1.9 1.9c-.78.78-.78 2.05 0 2.83l4.13 4.13L3 17.25V21h3.75l4.76-4.76 4.13 4.13c.95.95 2.23.6 2.83 0l1.9-1.9c.78-.78.78-2.05 0-2.83l-4.13-4.13zm-7.06-.44L5.04 6.94l1.89-1.9L8.2 6.31 7.02 7.5l1.41 1.41 1.19-1.19 1.45 1.45-1.89 1.9zm7.88 7.89-4.13-4.13 1.9-1.9 1.45 1.45-1.19 1.19 1.41 1.41 1.19-1.19 1.27 1.27-1.9 1.9zm3.65-11.92a.996.996 0 0 0 0-1.41l-2.34-2.34c-.47-.47-1.12-.29-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"
+          />
+        </svg>
+        <span class="empty-title">未选择事件</span>
+      </div>
 
-      <!-- 聚焦预设窗口展示曲线，聚焦事件窗口展示时间线 -->
       <div v-else key="design-workspace" class="design-workspace">
-      <!-- 下半窗口：参数面板、曲线画布与事件时间线共用主区域 -->
-      <div class="design-canvas-area">
+        <div class="design-canvas-area">
+          <div class="design-stage">
+      <!-- 事件时间线：与视频时间对应的剪辑式编辑轨道 -->
+      <section
+        ref="timelineEditorRef"
+        class="timeline-editor"
+        @wheel="handleTimelineWheel"
+      >
         <div
-          class="design-stage"
-          :class="{ 'is-timeline-mode': designViewMode === 'timeline' }"
+          class="timeline-scroll-shell"
+          @pointerenter="showTimelineScrollbar"
+          @pointermove="showTimelineScrollbar"
+          @pointerleave="hideTimelineScrollbarSoon"
         >
-        <div
-          ref="designViewRef"
-          class="design-view"
-          :aria-hidden="designViewMode === 'timeline'"
-          :inert="designViewMode === 'timeline'"
-        >
-      <!-- 顶部参数工具栏：快速颜色与参数控制项 -->
-      <div class="design-toolbar">
-        <!-- 历史颜色 -->
-        <div class="history-colors-box">
-          <div class="history-colors-header">
-            <span class="history-title">历史颜色</span>
-            <button
-              class="clear-history-btn"
-              :disabled="historyColors.length === 0"
-              type="button"
-              aria-label="一键清空历史颜色"
-              @click="clearHistoryColors"
-            >
-              <svg class="clear-history-icon" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
-              </svg>
-            </button>
-          </div>
-          <div v-if="historyColors.length > 0" class="history-colors-grid">
+          <div
+            ref="timelineScrollRef"
+            class="timeline-scroll"
+            :class="{
+              'is-interacting': timelineInteractionMode !== null,
+              'is-panning': timelineInteractionMode === 'pan',
+              'is-middle-panning': timelineInteractionPanButton === 1
+            }"
+            @scroll="handleTimelineScroll"
+          >
+          <div
+            ref="timelineContentRef"
+            class="timeline-content"
+            :style="timelineZoomStyle"
+            @dragover="handleTimelinePresetDragOver"
+            @dragleave="handleTimelinePresetDragLeave"
+            @drop="handleTimelinePresetDrop"
+          >
             <div
-              v-for="(color, idx) in historyColors"
-              :key="idx"
-              class="history-color-item"
-              :class="{ 'is-active': currentColor.toLowerCase() === color.toLowerCase() }"
-              :style="{ backgroundColor: color }"
-              @click="setColor(color)"
+              class="timeline-ruler"
+              @pointerdown.stop="startTimelinePlayheadDrag"
+              @click.stop="handleTimelineRulerClick"
             >
-              <button
-                class="remove-history-btn"
-                type="button"
-                @click="removeHistoryColor(idx, $event)"
+              <div
+                v-for="tick in timelineTicks"
+                :key="`timeline-tick-${tick.time}`"
+                class="timeline-tick"
+                :class="{ 'is-major': tick.major }"
+                :style="{ left: `${tick.left}%` }"
               >
-                ×
-              </button>
+                <span v-if="tick.major" class="timeline-tick-label">{{ tick.label }}</span>
+              </div>
+
+              <Transition name="timeline-drop-time">
+                <div
+                  v-if="timelinePresetDropPosition !== null"
+                  class="timeline-drop-time"
+                  :style="{ left: `${timelinePresetDropPosition}%` }"
+                >
+                  {{ timelinePresetDropTimeLabel }}
+                </div>
+              </Transition>
+
             </div>
+
+            <div
+              v-if="timelinePresetDropPosition !== null"
+              class="timeline-preset-drop-line"
+              :style="{ left: `${timelinePresetDropPosition}%` }"
+              aria-hidden="true"
+            />
+
+            <div
+              class="timeline-track"
+              :class="{ 'is-clip-dragging': timelineDraggingTriggerIds.length > 0 }"
+            >
+              <div
+                ref="timelineThumbnailStripRef"
+                class="timeline-thumbnail-strip"
+                aria-hidden="true"
+                @pointerdown.stop="startTimelineMediaDrag"
+              >
+                <TransitionGroup name="timeline-thumbnail" appear>
+                  <div
+                    v-for="thumbnail in timelineThumbnails"
+                    :key="`timeline-thumbnail-${thumbnail.time}`"
+                    class="timeline-thumbnail-cell"
+                    :style="{
+                      left: `${thumbnail.left}%`,
+                      width: `${thumbnail.width}%`
+                    }"
+                  >
+                    <img :src="thumbnail.src" alt="" draggable="false" />
+                  </div>
+                </TransitionGroup>
+              </div>
+
+              <div
+                class="timeline-waveform-strip"
+                aria-hidden="true"
+                @pointerdown.stop="startTimelineMediaDrag"
+              />
+
+              <div
+                ref="timelineWaveformLayerRef"
+                class="timeline-waveform-layer"
+                aria-hidden="true"
+              >
+                <Transition name="timeline-thumbnail" appear>
+                  <canvas
+                    v-if="timelineWaveformReady"
+                    :ref="setTimelineWaveformCanvasRef"
+                    class="timeline-waveform-canvas"
+                  />
+                </Transition>
+              </div>
+
+              <div
+                ref="timelineTracksViewportRef"
+                class="timeline-tracks-viewport"
+                @pointerdown.capture="startTimelineMiddleDrag"
+                @pointerdown="startTimelineMarqueeSelection"
+                @pointerenter="showTimelineVerticalScrollbar"
+                @pointermove="handleTimelineTracksPointerMove"
+                @pointerleave="handleTimelineTracksPointerLeave"
+                @contextmenu.prevent="openTimelineContextMenu(null, $event)"
+                @scroll="handleTimelineTracksScroll"
+              >
+                <div v-if="showTimelineEmptyState" class="timeline-empty-state">
+                  暂无轨道
+                </div>
+
+                <div
+                  class="timeline-tracks-content"
+                  :style="timelineTracksContentStyle"
+                >
+                  <div
+                    v-for="beat in timelineBeatMarkers"
+                    :key="beat.key"
+                    class="timeline-beat-line"
+                    :style="{ left: `${beat.left}%` }"
+                    aria-hidden="true"
+                  />
+
+                  <div
+                    v-if="timelineSelectedEventRange"
+                    class="timeline-event-range"
+                    :style="{
+                      left: `${getTimelinePositionPercent(timelineSelectedEventRange.startTime)}%`,
+                      width: `max(16px, ${getTimelineSpanPercent(timelineSelectedEventRange.durationSeconds)}%)`
+                    }"
+                  />
+
+                  <div
+                    v-for="trackIndex in timelineTrackIndexes"
+                    :key="`timeline-track-${trackIndex}`"
+                    class="timeline-preset-track"
+                    :class="{ 'is-drop-target': timelinePresetDropTrack === trackIndex }"
+                  >
+                    <div
+                      v-for="item in getTimelinePresetItemsForTrack(trackIndex)"
+                      :key="`timeline-preset-${item.playback.triggerId}`"
+                      class="timeline-clip"
+                      :class="{
+                        'is-selected': selectedTimelineTriggerIds.includes(
+                          item.playback.triggerId
+                        ),
+                        'is-playing': (
+                          playingEventId === item.event.id &&
+                          playingEventTriggerId === item.playback.triggerId
+                        ),
+                        'is-fill-dragging': (
+                          timelineFillDraggingTriggerId === item.playback.triggerId
+                        ),
+                        'is-fill-remove-preview': (
+                          timelineFillRemovePreviewTriggerIds.includes(
+                            item.playback.triggerId
+                          )
+                        ),
+                        'is-dragging': timelineDraggingTriggerIds.includes(
+                          item.playback.triggerId
+                        ),
+                        'is-duplicating': timelineDuplicatingTriggerId === item.playback.triggerId,
+                        'is-preset-drop-created': (
+                          timelineDropAnimatingTriggerId === item.playback.triggerId
+                        )
+                      }"
+                      :data-timeline-trigger-id="String(item.playback.triggerId)"
+                      :draggable="(
+                        timelineDropAnimatingTriggerId !== item.playback.triggerId &&
+                        timelineDuplicatingTriggerId !== item.playback.triggerId
+                      )"
+                      :style="{
+                        left: `${getTimelinePositionPercent(item.startTime)}%`,
+                        width: `max(16px, ${getTimelineSpanPercent(item.durationSeconds)}%)`,
+                        '--clip-color': item.color
+                      }"
+                      @dragstart="handleTimelineClipDragStart(item, $event)"
+                      @drag="handleTimelineClipDrag"
+                      @dragend="handleTimelineClipDragEnd(item, $event)"
+                      @contextmenu.prevent.stop="openTimelineContextMenu(item, $event)"
+                      @click.stop="seekTimelinePreset(item)"
+                        @dblclick.stop="duplicateTimelinePreset(item)"
+                        @pointerdown.stop
+                      >
+                        <button
+                          class="timeline-clip-resize-handle is-start"
+                          type="button"
+                          aria-label="拖动调整预设开始时间与持续时间"
+                          title="拖动调整开始时间与持续时间"
+                          draggable="false"
+                          @dragstart.stop.prevent
+                          @pointerdown.stop="startTimelinePresetResizeDrag('start', item, $event)"
+                          @click.stop
+                          @dblclick.stop
+                        />
+                        <button
+                          class="timeline-clip-resize-handle is-end"
+                          type="button"
+                          aria-label="拖动调整预设持续时间"
+                          title="拖动调整持续时间"
+                          draggable="false"
+                          @dragstart.stop.prevent
+                          @pointerdown.stop="startTimelinePresetResizeDrag('end', item, $event)"
+                          @click.stop
+                          @dblclick.stop
+                        />
+
+                        <div class="timeline-clip-content">
+                        <span class="timeline-clip-id">P{{ item.playback.preset.id }}</span>
+                        <span class="timeline-clip-name">{{ item.playback.preset.name }}</span>
+                      </div>
+
+                      <button
+                        class="timeline-clip-remove"
+                        type="button"
+                        :aria-label="(
+                          selectedTimelineTriggerIds.includes(item.playback.triggerId)
+                          && selectedTimelineTriggerIds.length > 1
+                        ) ? '批量删除选中预设' : '移除时间线预设'"
+                        :title="(
+                          selectedTimelineTriggerIds.includes(item.playback.triggerId)
+                          && selectedTimelineTriggerIds.length > 1
+                        ) ? '批量删除选中预设' : '移除时间线预设'"
+                        draggable="false"
+                        @dragstart.stop.prevent
+                        @pointerdown.stop
+                        @click.stop="removeTimelinePreset(item, $event)"
+                        @dblclick.stop
+                      >
+                          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                            <path d="M18.3 5.71a.996.996 0 0 0-1.41 0L12 10.59 7.11 5.7A.996.996 0 1 0 5.7 7.11L10.59 12 5.7 16.89a.996.996 0 1 0 1.41 1.41L12 13.41l4.89 4.89a.996.996 0 1 0 1.41-1.41L13.41 12l4.89-4.89c.38-.38.38-1.02 0-1.4z" />
+                          </svg>
+                      </button>
+
+                      <button
+                        class="timeline-clip-fill-handle"
+                        type="button"
+                        aria-label="拖动批量复制或移除预设"
+                        title="拖动复制或移除"
+                        draggable="false"
+                        @dragstart.stop.prevent
+                        @pointerdown.stop.prevent="handleTimelineClipFillPointerDown(item, $event)"
+                        @pointermove="handleTimelineClipFillPointerMove"
+                        @pointerup="handleTimelineClipFillPointerUp"
+                        @pointercancel="handleTimelineClipFillPointerCancel"
+                        @lostpointercapture="handleTimelineClipFillPointerLostCapture"
+                        @click.stop
+                        @dblclick.stop
+                      >
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                          <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+                        </svg>
+                      </button>
+                    </div>
+
+                    <div
+                      v-for="preview in getTimelineFillPreviewsForTrack(trackIndex)"
+                      :key="preview.key"
+                      class="timeline-clip-fill-preview"
+                      :style="{
+                        left: `${getTimelinePositionPercent(preview.startTime)}%`,
+                        width: `max(16px, ${getTimelineSpanPercent(preview.durationSeconds)}%)`,
+                        '--clip-color': preview.color
+                      }"
+                      aria-hidden="true"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div
+                v-if="timelineMarqueeRect"
+                class="timeline-marquee"
+                :style="{
+                  left: `${timelineMarqueeRect.left}px`,
+                  top: `${timelineMarqueeRect.top}px`,
+                  width: `${timelineMarqueeRect.width}px`,
+                  height: `${timelineMarqueeRect.height}px`
+                }"
+                aria-hidden="true"
+              />
+
+            </div>
+
+            <div
+              ref="timelinePlayheadRef"
+              class="timeline-playhead"
+              :class="{ 'is-preset-dragging': presetDragPointerOffsetX !== null }"
+              @pointerdown.stop="startTimelinePlayheadDrag"
+              @click.stop="handleTimelineRulerClick"
+            />
           </div>
-          <div v-else class="empty-history-box">
-            <span class="empty-history-text">暂无历史颜色</span>
+        </div>
+          <div
+            ref="timelineScrollbarRef"
+            class="timeline-overlay-scrollbar"
+            :class="{ 'is-visible': timelineScrollbarVisible }"
+            :aria-hidden="!timelineScrollbarVisible"
+            role="scrollbar"
+            aria-label="时间线横向滚动"
+            aria-orientation="horizontal"
+            @pointerdown.stop="startTimelineScrollbarDrag"
+            @pointermove.stop="handleTimelineScrollbarPointerMove"
+            @pointerup.stop="finishTimelineScrollbarDrag"
+            @pointercancel.stop="finishTimelineScrollbarDrag"
+            @lostpointercapture.stop="finishTimelineScrollbarDrag"
+          >
+            <div
+              class="timeline-overlay-scrollbar-thumb"
+              :style="{
+                width: `${timelineScrollbarThumbWidth}px`,
+                transform: `translate3d(${timelineScrollbarThumbLeft}px, 0, 0)`
+              }"
+            />
+          </div>
+          <div
+            ref="timelineVerticalScrollbarRef"
+            class="timeline-overlay-vertical-scrollbar"
+            :class="{ 'is-visible': timelineVerticalScrollbarVisible }"
+            :aria-hidden="!timelineVerticalScrollbarVisible"
+            role="scrollbar"
+            aria-label="时间线轨道纵向滚动"
+            aria-orientation="vertical"
+            @pointerenter="showTimelineVerticalScrollbar"
+            @pointerdown.stop="startTimelineVerticalScrollbarDrag"
+            @pointermove.stop="handleTimelineVerticalScrollbarPointerMove"
+            @pointerup.stop="finishTimelineVerticalScrollbarDrag"
+            @pointercancel.stop="finishTimelineVerticalScrollbarDrag"
+            @lostpointercapture.stop="finishTimelineVerticalScrollbarDrag"
+          >
+            <div
+              class="timeline-overlay-vertical-scrollbar-thumb"
+              :style="{
+                height: `${timelineVerticalScrollbarThumbHeight}px`,
+                transform: `translate3d(0, ${timelineVerticalScrollbarThumbTop}px, 0)`
+              }"
+            />
           </div>
         </div>
 
-        <div class="toolbar-divider" />
+        <div class="timeline-toolbar">
+          <div class="timeline-heading">
+            <span v-if="selectedTimelineEvent" class="timeline-selection">{{ selectedTimelineEventLabel }}</span>
+            <span v-else class="timeline-selection is-empty">未选择事件</span>
+          </div>
 
-        <!-- 色彩数值输入列 (十六进制上，RGB 下) -->
-        <div class="color-values-col">
-          <!-- HEX 文本输入行 -->
-          <div class="color-input-row">
-            <div class="color-val-input-wrapper hex-wrapper">
-              <span
-                class="color-preview-swatch"
-                :style="{ backgroundColor: currentColor }"
-                @click="fallbackInputRef?.click()"
-              />
-              <span class="color-val-prefix">#</span>
-              <input
-                type="text"
-                class="color-val-input hex-input"
-                :value="displayHex"
-                maxlength="6"
-                spellcheck="false"
-                @focus="onHexFocus"
-                @blur="onHexBlur"
-                @input="onHexInput"
-                @keydown="onHexKeydown"
-              />
-            </div>
+          <div class="timeline-time-readout">
+            {{ timelineCurrentTimeLabel }} / {{ timelineDurationLabel }}
+          </div>
+
+          <div class="timeline-zoom-controls">
+            <span class="timeline-axis-name">X</span>
             <button
-              class="eyedropper-btn"
+              class="timeline-zoom-btn"
               type="button"
-              aria-label="吸色工具"
-              @click="pickScreenColor"
+              aria-label="缩小时间线"
+              :disabled="timelineZoom <= 1"
+              @click="setTimelineZoom(-1)"
             >
-              <svg class="eyedropper-icon" viewBox="0 0 24 24" fill="currentColor">
-                <path
-                  d="M20.71 5.63l-2.34-2.34a.996.996 0 0 0-1.41 0l-3.12 3.12-1.93-1.91-1.41 1.41 1.42 1.42L3 16.25V21h4.75l8.92-8.92 1.42 1.42 1.41-1.41-1.92-1.92 3.12-3.12c.4-.4.4-1.03.01-1.42zM6.92 19L5 17.08l8.06-8.06 1.92 1.92L6.92 19z"
-                />
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19 13H5v-2h14v2z" />
+              </svg>
+            </button>
+            <span class="timeline-zoom-value">{{ timelineZoom.toFixed(2) }}</span>
+              <button
+                class="timeline-zoom-btn"
+                type="button"
+                aria-label="放大时间线"
+                :disabled="isTimelineAtMaxZoom"
+                @click="setTimelineZoom(1)"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
               </svg>
             </button>
           </div>
 
-          <!-- RGB 数值输入行 -->
-          <div class="color-input-row">
-            <div class="color-val-input-wrapper rgb-wrapper">
-              <span class="color-val-prefix rgb-prefix">RGB</span>
-              <input
-                type="text"
-                class="color-val-input rgb-input"
-                :value="displayRgb"
-                spellcheck="false"
-                @focus="onRgbFocus"
-                @blur="onRgbBlur"
-                @input="onRgbInput"
-                @keydown="onRgbKeydown"
-              />
-            </div>
+          <div class="timeline-zoom-controls">
+            <span class="timeline-axis-name">Y</span>
             <button
-              class="add-history-btn"
+              class="timeline-zoom-btn"
               type="button"
-              @click="addRgbToHistory"
+              aria-label="缩小时间线轨道高度"
+              :disabled="timelineVerticalZoom <= TIMELINE_VERTICAL_ZOOM_MIN"
+              @click="setTimelineVerticalZoom(-TIMELINE_VERTICAL_ZOOM_STEP)"
             >
-              +
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19 13H5v-2h14v2z" />
+              </svg>
             </button>
-          </div>
-        </div>
-
-        <!-- 播放参数控制列 (重复 上，周期 下，可输入与微调) -->
-        <div class="playback-params-col">
-          <!-- 重复次数 (可直接输入，也可微调) -->
-          <div class="param-stepper-box">
-            <span class="param-stepper-label">重复</span>
-            <div class="stepper-controls">
-              <button
-                class="stepper-btn"
-                type="button"
-                :disabled="currentRepeat <= 1"
-                @click="changeRepeat(-1)"
-              >
-                -
-              </button>
-              <input
-                type="text"
-                class="stepper-input"
-                :value="displayRepeat"
-                spellcheck="false"
-                @focus="onRepeatFocus"
-                @blur="onRepeatBlur"
-                @input="onRepeatInput"
-                @keydown="onRepeatKeydown"
-              />
-              <span class="stepper-unit">次</span>
-              <button
-                class="stepper-btn"
-                type="button"
-                :disabled="currentRepeat >= 99"
-                @click="changeRepeat(1)"
-              >
-                +
-              </button>
-            </div>
-          </div>
-
-          <!-- 周期时长 (可直接输入，也可微调) -->
-          <div class="param-stepper-box">
-            <span class="param-stepper-label">周期</span>
-            <div class="stepper-controls">
-              <button
-                class="stepper-btn"
-                type="button"
-                :disabled="currentDuration <= 50"
-                @click="changeDuration(-50)"
-              >
-                -
-              </button>
-              <input
-                type="text"
-                class="stepper-input"
-                :value="displayDuration"
-                spellcheck="false"
-                @focus="onDurationFocus"
-                @blur="onDurationBlur"
-                @input="onDurationInput"
-                @keydown="onDurationKeydown"
-              />
-              <span class="stepper-unit">ms</span>
-              <button
-                class="stepper-btn"
-                type="button"
-                :disabled="currentDuration >= 20000"
-                @click="changeDuration(50)"
-              >
-                +
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div class="toolbar-divider" />
-
-        <!-- 预设效果预览方块 (仅为一个颜色方块，仅预览当前预设的效果，点击预览按钮生效) -->
-        <div
-          ref="previewBoxRef"
-          class="effect-preview-box"
-          @click="togglePlay"
-        />
-
-        <!-- 降级取色器（隐藏） -->
-        <input
-          ref="fallbackInputRef"
-          type="color"
-          class="hidden-color-input"
-          :value="currentColor"
-          @input="applyPickedColor(($event.target as HTMLInputElement).value)"
-        />
-        </div>
-        <!-- 曲线顶栏：曲线切换、提示与自定义曲线模版 -->
-        <div class="curve-toolbar">
-          <div class="tool-left-group">
-            <!-- 双曲线选择切换滑块 -->
-            <div class="curve-selector-group">
-              <div class="curve-sel-glider" :class="activeCurveType" />
-              <button
-                class="curve-sel-btn"
-                :class="{ 'is-active': activeCurveType === 'brightness' }"
-                type="button"
-                @click="activeCurveType = 'brightness'"
-              >
-                <span>亮度曲线</span>
-              </button>
-              <button
-                class="curve-sel-btn"
-                :class="{ 'is-active': activeCurveType === 'color' }"
-                type="button"
-                @click="activeCurveType = 'color'"
-              >
-                <span>颜色曲线</span>
-              </button>
-            </div>
-
-            <!-- 曲线操作工具组 (鼠标、笔、添加、删除) -->
-            <div class="curve-tools-group" role="toolbar" aria-label="曲线编辑工具">
-              <button
-                class="curve-tool-btn"
-                :class="{ 'is-active': activeEditTool === 'pointer' }"
-                type="button"
-                aria-label="鼠标选择工具"
-                @click="activeEditTool = 'pointer'"
-              >
-                <svg class="curve-tool-icon" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M7 2l12 11.2-5.8.5 3.3 7.3-2.2 1-3.2-7.4L7 18.5V2z" />
-                </svg>
-              </button>
-              <button
-                class="curve-tool-btn"
-                :class="{ 'is-active': activeEditTool === 'pen' }"
-                type="button"
-                aria-label="笔工具"
-                @click="activeEditTool = 'pen'"
-              >
-                <svg class="curve-tool-icon" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.996.996 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
-                </svg>
-              </button>
-              <button
-                class="curve-tool-btn"
-                :class="{ 'is-active': activeEditTool === 'add' }"
-                type="button"
-                aria-label="添加节点工具"
-                @click="activeEditTool = 'add'"
-              >
-                <svg class="curve-tool-icon" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
-                </svg>
-              </button>
-              <button
-                class="curve-tool-btn"
-                :class="{ 'is-active': activeEditTool === 'delete' }"
-                type="button"
-                aria-label="删除节点工具"
-                @click="activeEditTool = 'delete'"
-              >
-                <svg class="curve-tool-icon" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
-                </svg>
-              </button>
-            </div>
-          </div>
-
-          <!-- 曲线模板栏 -->
-          <div class="custom-templates-group">
-            <div v-if="activeCurveTemplates.length > 0" class="templates-list">
-              <div
-                v-for="tmpl in activeCurveTemplates"
-                :key="tmpl.id"
-                class="template-pill-btn"
-                :class="{ 'is-editing': editingTemplateId === tmpl.id }"
-                role="button"
-                tabindex="0"
-                @click="editingTemplateId === tmpl.id ? null : applyCurveTemplate(tmpl)"
-                @dblclick.stop="startEditTemplate(tmpl)"
-                @keydown.enter="editingTemplateId === tmpl.id ? null : applyCurveTemplate(tmpl)"
-              >
-                <template v-if="editingTemplateId === tmpl.id">
-                  <input
-                    ref="templateEditInputRef"
-                    v-model="editingTemplateName"
-                    class="template-name-input"
-                    type="text"
-                    @click.stop
-                    @dblclick.stop
-                    @blur="saveEditTemplate(tmpl)"
-                    @keydown.enter="saveEditTemplate(tmpl)"
-                    @keydown.esc="cancelEditTemplate"
-                  />
-                  <!-- 删除垃圾桶图标（位于打钩保存左侧） -->
-                  <span
-                    class="del-tmpl-btn"
-                    aria-label="删除此模板"
-                    @mousedown.prevent
-                    @click.stop="removeCurveTemplate(tmpl.id, $event)"
-                  >
-                    <svg class="tmpl-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" />
-                    </svg>
-                  </span>
-                  <!-- 打钩完成保存图标 -->
-                  <span
-                    class="save-tmpl-check"
-                    aria-label="完成保存"
-                    @mousedown.prevent
-                    @click.stop="saveEditTemplate(tmpl)"
-                  >
-                    <svg class="tmpl-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
-                    </svg>
-                  </span>
-                </template>
-                <template v-else>
-                  <span class="tmpl-name-text">{{ tmpl.name }}</span>
-                </template>
-              </div>
-            </div>
+            <span class="timeline-zoom-value">{{ timelineVerticalZoom.toFixed(2) }}</span>
             <button
-              class="save-tmpl-btn"
+              class="timeline-zoom-btn"
               type="button"
-              aria-label="保存为模板"
-              @click="addCurrentCurveAsTemplate"
+              aria-label="放大时间线轨道高度"
+              :disabled="timelineVerticalZoom >= TIMELINE_VERTICAL_ZOOM_MAX"
+              @click="setTimelineVerticalZoom(TIMELINE_VERTICAL_ZOOM_STEP)"
             >
-              <svg class="save-tmpl-icon" viewBox="0 0 24 24" fill="currentColor">
+              <svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
               </svg>
             </button>
           </div>
         </div>
-
-        <!-- 双曲线画布视口 -->
-        <div
-          ref="canvasViewportRef"
-          class="curve-canvas-viewport"
-        >
-          <canvas
-            ref="curveCanvasRef"
-            :class="['curve-canvas', canvasCursorClass]"
-            @pointerdown="onCanvasPointerDown"
-            @pointermove="onCanvasPointerMove"
-            @pointerup="onCanvasPointerUp"
-            @pointercancel="onCanvasPointerUp"
-            @lostpointercapture="onCanvasPointerUp"
-            @dblclick="onCanvasDblClick"
-            @contextmenu="onCanvasContextMenu"
-          />
+      </section>
+          </div>
         </div>
-          </div>
-
-        <!-- 事件时间线：与视频时间对应的剪辑式编辑轨道 -->
-        <section
-          ref="timelineEditorRef"
-          class="timeline-editor"
-          :aria-hidden="designViewMode !== 'timeline'"
-          :inert="designViewMode !== 'timeline'"
-          @wheel="handleTimelineWheel"
-        >
-          <div
-            class="timeline-scroll-shell"
-            @pointerenter="showTimelineScrollbar"
-            @pointermove="showTimelineScrollbar"
-            @pointerleave="hideTimelineScrollbarSoon"
-          >
-            <div
-              ref="timelineScrollRef"
-              class="timeline-scroll"
-              :class="{
-                'is-interacting': timelineInteractionMode !== null,
-                'is-panning': timelineInteractionMode === 'pan'
-              }"
-              @scroll="handleTimelineScroll"
-            >
-            <div
-              ref="timelineContentRef"
-              class="timeline-content"
-              :style="timelineZoomStyle"
-              @dragover="handleTimelinePresetDragOver"
-              @dragleave="handleTimelinePresetDragLeave"
-              @drop="handleTimelinePresetDrop"
-            >
-              <div
-                class="timeline-ruler"
-                @pointerdown.stop="startTimelinePlayheadDrag"
-                @click.stop="handleTimelineRulerClick"
-              >
-                <div
-                  v-for="tick in timelineTicks"
-                  :key="`timeline-tick-${tick.time}`"
-                  class="timeline-tick"
-                  :class="{ 'is-major': tick.major }"
-                  :style="{ left: `${tick.left}%` }"
-                >
-                  <span v-if="tick.major" class="timeline-tick-label">{{ tick.label }}</span>
-                </div>
-
-                <Transition name="timeline-drop-time">
-                  <div
-                    v-if="timelinePresetDropPosition !== null"
-                    class="timeline-drop-time"
-                    :style="{ left: `${timelinePresetDropPosition}%` }"
-                  >
-                    {{ timelinePresetDropTimeLabel }}
-                  </div>
-                </Transition>
-              </div>
-
-              <div
-                class="timeline-track"
-              >
-                <div
-                  ref="timelineThumbnailStripRef"
-                  class="timeline-thumbnail-strip"
-                  aria-hidden="true"
-                  @pointerdown.stop="startTimelineMediaDrag"
-                >
-                  <TransitionGroup name="timeline-thumbnail">
-                    <div
-                      v-for="thumbnail in timelineThumbnails"
-                      :key="`timeline-thumbnail-${thumbnail.time}`"
-                      class="timeline-thumbnail-cell"
-                      :style="{
-                        left: `${thumbnail.left}%`,
-                        width: `${thumbnail.width}%`
-                      }"
-                    >
-                      <img :src="thumbnail.src" alt="" draggable="false" />
-                    </div>
-                  </TransitionGroup>
-                </div>
-
-                <div
-                  class="timeline-waveform-strip"
-                  aria-hidden="true"
-                  @pointerdown.stop="startTimelineMediaDrag"
-                />
-
-                <Transition name="timeline-waveform">
-                  <canvas
-                    v-if="timelineWaveformReady"
-                    ref="timelineWaveformCanvasRef"
-                    class="timeline-waveform-canvas"
-                    aria-hidden="true"
-                  />
-                </Transition>
-
-                <div
-                  ref="timelineTracksViewportRef"
-                  class="timeline-tracks-viewport"
-                  @pointerenter="showTimelineVerticalScrollbar"
-                  @pointermove="showTimelineVerticalScrollbar"
-                  @pointerleave="hideTimelineVerticalScrollbarSoon"
-                  @scroll="handleTimelineTracksScroll"
-                >
-                  <div v-if="showTimelineEmptyState" class="timeline-empty-state">
-                    暂无轨道
-                  </div>
-
-                  <div
-                    class="timeline-tracks-content"
-                    :style="timelineTracksContentStyle"
-                  >
-                    <div
-                      v-if="timelineSelectedEventRange"
-                      class="timeline-event-range"
-                      :style="{
-                        left: `${getTimelinePositionPercent(timelineSelectedEventRange.startTime)}%`,
-                        width: `max(16px, ${getTimelineSpanPercent(timelineSelectedEventRange.durationSeconds)}%)`
-                      }"
-                    />
-
-                    <div
-                      v-for="trackIndex in timelineTrackIndexes"
-                      :key="`timeline-track-${trackIndex}`"
-                      class="timeline-preset-track"
-                      :class="{ 'is-drop-target': timelinePresetDropTrack === trackIndex }"
-                    >
-                      <div
-                        v-for="item in getTimelinePresetItemsForTrack(trackIndex)"
-                        :key="`timeline-preset-${item.playback.triggerId}`"
-                        class="timeline-clip"
-                        :class="{
-                          'is-selected': timelineEventId === item.event.id,
-                          'is-playing': (
-                            playingEventId === item.event.id &&
-                            playingEventTriggerId === item.playback.triggerId
-                          ),
-                          'is-dragging': timelineDraggingTriggerId === item.playback.triggerId,
-                          'is-duplicating': timelineDuplicatingTriggerId === item.playback.triggerId,
-                          'is-preset-drop-created': (
-                            timelineDropAnimatingTriggerId === item.playback.triggerId
-                          )
-                        }"
-                        :data-timeline-trigger-id="String(item.playback.triggerId)"
-                        :draggable="(
-                          timelineDropAnimatingTriggerId !== item.playback.triggerId &&
-                          timelineDuplicatingTriggerId !== item.playback.triggerId
-                        )"
-                        :style="{
-                          left: `${getTimelinePositionPercent(item.startTime)}%`,
-                          width: `max(16px, ${getTimelineSpanPercent(item.durationSeconds)}%)`,
-                          '--clip-color': item.color
-                        }"
-                        @dragstart="handleTimelineClipDragStart(item, $event)"
-                        @drag="handleTimelineClipDrag"
-                        @dragend="handleTimelineClipDragEnd(item, $event)"
-                        @click.stop="seekTimelinePreset(item)"
-                        @dblclick.stop="duplicateTimelinePreset(item)"
-                        @pointerdown.stop
-                      >
-                        <div class="timeline-clip-progress">
-                          <span
-                            :ref="element => setTimelineClipProgressRef(
-                              item.playback.triggerId,
-                              element
-                            )"
-                          />
-                        </div>
-
-                        <div class="timeline-clip-content">
-                          <span class="timeline-clip-id">P{{ item.playback.preset.id }}</span>
-                          <span class="timeline-clip-name">{{ item.playback.preset.name }}</span>
-                        </div>
-
-                        <button
-                          class="timeline-clip-remove"
-                          type="button"
-                          aria-label="移除时间线预设"
-                          draggable="false"
-                          @dragstart.stop.prevent
-                          @pointerdown.stop
-                          @click.stop="removeTimelinePreset(item, $event)"
-                          @dblclick.stop
-                        >
-                          <svg viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.41 4.29 19.71 2.88 18.29 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.29-6.3z" />
-                          </svg>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div
-                  ref="timelinePlayheadRef"
-                  class="timeline-playhead"
-                  @pointerdown.stop="startTimelinePlayheadDrag"
-                  @click.stop="handleTimelineRulerClick"
-                >
-                  <span class="timeline-playhead-cap" />
-                </div>
-              </div>
-            </div>
-          </div>
-            <div
-              ref="timelineScrollbarRef"
-              class="timeline-overlay-scrollbar"
-              :class="{ 'is-visible': timelineScrollbarVisible }"
-              :aria-hidden="!timelineScrollbarVisible"
-              role="scrollbar"
-              aria-label="时间线横向滚动"
-              aria-orientation="horizontal"
-              @pointerdown.stop="startTimelineScrollbarDrag"
-              @pointermove.stop="handleTimelineScrollbarPointerMove"
-              @pointerup.stop="finishTimelineScrollbarDrag"
-              @pointercancel.stop="finishTimelineScrollbarDrag"
-              @lostpointercapture.stop="finishTimelineScrollbarDrag"
-            >
-              <div
-                class="timeline-overlay-scrollbar-thumb"
-                :style="{
-                  width: `${timelineScrollbarThumbWidth}px`,
-                  transform: `translate3d(${timelineScrollbarThumbLeft}px, 0, 0)`
-                }"
-              />
-            </div>
-            <div
-              ref="timelineVerticalScrollbarRef"
-              class="timeline-overlay-vertical-scrollbar"
-              :class="{ 'is-visible': timelineVerticalScrollbarVisible }"
-              :aria-hidden="!timelineVerticalScrollbarVisible"
-              role="scrollbar"
-              aria-label="时间线轨道纵向滚动"
-              aria-orientation="vertical"
-              @pointerenter="showTimelineVerticalScrollbar"
-              @pointerdown.stop="startTimelineVerticalScrollbarDrag"
-              @pointermove.stop="handleTimelineVerticalScrollbarPointerMove"
-              @pointerup.stop="finishTimelineVerticalScrollbarDrag"
-              @pointercancel.stop="finishTimelineVerticalScrollbarDrag"
-              @lostpointercapture.stop="finishTimelineVerticalScrollbarDrag"
-            >
-              <div
-                class="timeline-overlay-vertical-scrollbar-thumb"
-                :style="{
-                  height: `${timelineVerticalScrollbarThumbHeight}px`,
-                  transform: `translate3d(0, ${timelineVerticalScrollbarThumbTop}px, 0)`
-                }"
-              />
-            </div>
-          </div>
-
-          <div class="timeline-toolbar">
-            <div class="timeline-heading">
-              <span v-if="selectedTimelineEvent" class="timeline-selection">{{ selectedTimelineEventLabel }}</span>
-              <span v-else class="timeline-selection is-empty">未选择事件</span>
-            </div>
-
-            <div class="timeline-time-readout">
-              {{ timelineCurrentTimeLabel }} / {{ timelineDurationLabel }}
-            </div>
-
-            <div class="timeline-zoom-controls">
-              <span class="timeline-axis-name">X</span>
-              <button
-                class="timeline-zoom-btn"
-                type="button"
-                aria-label="缩小时间线"
-                :disabled="timelineZoom <= 1"
-                @click="setTimelineZoom(-1)"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M19 13H5v-2h14v2z" />
-                </svg>
-              </button>
-              <span class="timeline-zoom-value">{{ timelineZoom.toFixed(2) }}</span>
-              <button
-                class="timeline-zoom-btn"
-                type="button"
-                aria-label="放大时间线"
-                @click="setTimelineZoom(1)"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
-                </svg>
-              </button>
-            </div>
-
-            <div class="timeline-zoom-controls">
-              <span class="timeline-axis-name">Y</span>
-              <button
-                class="timeline-zoom-btn"
-                type="button"
-                aria-label="缩小时间线轨道高度"
-                :disabled="timelineVerticalZoom <= TIMELINE_VERTICAL_ZOOM_MIN"
-                @click="setTimelineVerticalZoom(-TIMELINE_VERTICAL_ZOOM_STEP)"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M19 13H5v-2h14v2z" />
-                </svg>
-              </button>
-              <span class="timeline-zoom-value">{{ timelineVerticalZoom.toFixed(2) }}</span>
-              <button
-                class="timeline-zoom-btn"
-                type="button"
-                aria-label="放大时间线轨道高度"
-                :disabled="timelineVerticalZoom >= TIMELINE_VERTICAL_ZOOM_MAX"
-                @click="setTimelineVerticalZoom(TIMELINE_VERTICAL_ZOOM_STEP)"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
-                </svg>
-              </button>
-            </div>
-          </div>
-        </section>
-        </div>
-      </div>
       </div>
     </Transition>
 
@@ -5569,8 +5991,105 @@ defineExpose({
           {{ timelinePresetDropFlight.presetName }}
         </span>
       </div>
-    </Teleport>
 
+      <Transition name="timeline-context-menu">
+        <div
+          v-if="timelineContextMenu.visible"
+          class="timeline-context-menu"
+          role="menu"
+          aria-label="时间线预设操作"
+          :style="{
+            left: `${timelineContextMenu.x}px`,
+            top: `${timelineContextMenu.y}px`
+          }"
+          @contextmenu.prevent.stop
+          @pointerdown.stop
+        >
+          <button
+            class="timeline-context-menu-item"
+            type="button"
+            role="menuitem"
+            title="复制选中预设"
+            aria-label="复制选中预设"
+            aria-keyshortcuts="Control+C Meta+C"
+            :disabled="selectedTimelineTriggerIds.length === 0"
+            @click="copyTimelineSelection()"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+              <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+            </svg>
+            <span class="timeline-context-menu-label">复制</span>
+            <kbd class="timeline-context-menu-shortcut">Ctrl C</kbd>
+          </button>
+
+          <button
+            class="timeline-context-menu-item"
+            type="button"
+            role="menuitem"
+            title="剪切选中预设"
+            aria-label="剪切选中预设"
+            aria-keyshortcuts="Control+X Meta+X"
+            :disabled="selectedTimelineTriggerIds.length === 0"
+            @click="cutTimelineSelection()"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="6" cy="6" r="3" />
+              <path d="M8.12 8.12 12 12" />
+              <path d="M20 4 8.12 15.88" />
+              <circle cx="6" cy="18" r="3" />
+              <path d="M14.8 14.8 20 20" />
+            </svg>
+            <span class="timeline-context-menu-label">剪切</span>
+            <kbd class="timeline-context-menu-shortcut">Ctrl X</kbd>
+          </button>
+
+          <button
+            class="timeline-context-menu-item"
+            type="button"
+            role="menuitem"
+            title="粘贴到鼠标位置"
+            aria-label="粘贴到鼠标位置"
+            aria-keyshortcuts="Control+V Meta+V"
+            :disabled="!(timelineClipboard?.items.length)"
+            @click="pasteTimelineClipboard()"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M15 2H9a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1Z" />
+              <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2" />
+              <path d="M12 11v6" />
+              <path d="M9 14h6" />
+            </svg>
+            <span class="timeline-context-menu-label">粘贴</span>
+            <kbd class="timeline-context-menu-shortcut">Ctrl V</kbd>
+          </button>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -5642,394 +6161,6 @@ defineExpose({
   overflow: hidden;
 }
 
-/* 顶部参数工具栏 */
-.design-toolbar {
-  display: flex;
-  align-items: center;
-  padding: 8px 14px;
-  gap: 14px;
-  background-color: var(--md-sys-color-surface-container-high, #282c35);
-  border-bottom: 1px solid var(--md-sys-color-outline-variant, rgba(255, 255, 255, 0.08));
-  flex-shrink: 0;
-  flex-wrap: wrap;
-}
-
-/* 历史颜色面板 */
-.history-colors-box {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  min-width: 120px;
-}
-
-.history-colors-header {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  height: 18px;
-}
-
-.clear-history-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 3px;
-  background: transparent;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  cursor: pointer;
-  outline: none;
-  transition: all 0.12s ease;
-  flex-shrink: 0;
-}
-
-.clear-history-btn:hover:not(:disabled) {
-  background-color: rgba(255, 82, 82, 0.2);
-  color: var(--md-sys-color-error, #f28b82);
-}
-
-.clear-history-btn:active:not(:disabled) {
-  transform: scale(0.92);
-}
-
-.clear-history-btn:disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-
-.clear-history-icon {
-  width: 12px;
-  height: 12px;
-}
-
-.history-title {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-}
-
-.history-colors-grid {
-  display: grid;
-  grid-template-columns: repeat(5, 18px);
-  gap: 5px;
-  max-width: 120px;
-  min-height: 41px;
-}
-
-.history-color-item {
-  position: relative;
-  width: 18px;
-  height: 18px;
-  border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  cursor: pointer;
-  box-sizing: border-box;
-  transition: border-color 0.15s ease;
-}
-
-.history-color-item:hover {
-  border-color: rgba(255, 255, 255, 0.7);
-}
-
-.history-color-item.is-active {
-  outline: 2px solid var(--md-sys-color-primary, #8ab4f8);
-  outline-offset: 1px;
-  border-color: transparent;
-}
-
-.remove-history-btn {
-  position: absolute;
-  top: -4px;
-  right: -4px;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #ff5252;
-  color: #ffffff;
-  border: none;
-  font-size: 9px;
-  line-height: 1;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  padding: 0;
-}
-
-.history-color-item:hover .remove-history-btn {
-  display: flex;
-}
-
-.empty-history-box {
-  height: 41px;
-  width: 110px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px dashed rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
-}
-
-.empty-history-text {
-  font-size: 11px;
-  color: var(--md-sys-color-outline, #727b8c);
-  user-select: none;
-}
-
-/* 分隔线 */
-.toolbar-divider {
-  width: 1px;
-  height: 54px;
-  background-color: var(--md-sys-color-outline-variant, rgba(255, 255, 255, 0.1));
-}
-
-/* 色彩数值列 (十六进制上，RGB 下) */
-.color-values-col {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.color-input-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.color-val-input-wrapper {
-  display: inline-flex;
-  align-items: center;
-  height: 24px;
-  background-color: var(--md-sys-color-surface-container-highest, #323843);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 4px;
-  padding: 0 7px;
-  width: 142px;
-  box-sizing: border-box;
-  transition: border-color 0.15s ease;
-}
-
-.color-val-input-wrapper:focus-within {
-  border-color: var(--md-sys-color-primary, #8ab4f8);
-}
-
-/* 十六进制 # 左侧颜色小方块预览 */
-.color-preview-swatch {
-  width: 12px;
-  height: 12px;
-  border-radius: 2.5px;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  margin-right: 5px;
-  flex-shrink: 0;
-  cursor: pointer;
-  transition: border-color 0.15s ease;
-}
-
-.color-preview-swatch:hover {
-  border-color: #ffffff;
-}
-
-.color-val-prefix {
-  font-family: 'Google Sans', sans-serif;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  margin-right: 4px;
-  user-select: none;
-}
-
-.color-val-prefix.rgb-prefix {
-  font-size: 10px;
-  letter-spacing: 0.5px;
-}
-
-.color-val-input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: none;
-  outline: none;
-  font-family: 'Google Sans', sans-serif;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--md-sys-color-on-surface, #e8edf2);
-  padding: 0;
-}
-
-.hex-input {
-  text-transform: uppercase;
-}
-
-/* 输入框旁添加到历史颜色加号按钮 */
-.add-history-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 4px;
-  background-color: var(--md-sys-color-surface-container-highest, #323843);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  font-size: 14px;
-  line-height: 1;
-  font-weight: bold;
-  cursor: pointer;
-  padding: 0;
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-
-.add-history-btn:hover {
-  background-color: rgba(255, 255, 255, 0.08);
-  color: var(--md-sys-color-primary, #8ab4f8);
-  border-color: var(--md-sys-color-primary, #8ab4f8);
-}
-
-/* 吸色按钮 (与 add-history-btn 保持 24x24 紧凑结构一致) */
-.eyedropper-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 4px;
-  background-color: var(--md-sys-color-surface-container-highest, #323843);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  cursor: pointer;
-  padding: 0;
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-
-.eyedropper-btn:hover {
-  background-color: rgba(255, 255, 255, 0.08);
-  color: var(--md-sys-color-primary, #8ab4f8);
-  border-color: var(--md-sys-color-primary, #8ab4f8);
-}
-
-.eyedropper-icon {
-  width: 14px;
-  height: 14px;
-}
-
-.hidden-color-input {
-  position: absolute;
-  width: 0;
-  height: 0;
-  opacity: 0;
-  pointer-events: none;
-}
-
-/* 播放参数控制列 (重复 上，周期 下) */
-.playback-params-col {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.param-stepper-box {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.param-stepper-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  white-space: nowrap;
-  width: 24px;
-  flex-shrink: 0;
-}
-
-.stepper-controls {
-  display: inline-flex;
-  align-items: center;
-  background-color: var(--md-sys-color-surface-container-highest, #323843);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 4px;
-  overflow: hidden;
-  height: 24px;
-  width: 112px;
-  box-sizing: border-box;
-  transition: border-color 0.15s ease;
-}
-
-.stepper-controls:focus-within {
-  border-color: var(--md-sys-color-primary, #8ab4f8);
-}
-
-.stepper-btn {
-  width: 20px;
-  height: 100%;
-  border: none;
-  background: transparent;
-  color: var(--md-sys-color-on-surface, #e8edf2);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  font-weight: bold;
-  outline: none;
-  transition: background-color 0.12s ease;
-  padding: 0;
-  flex-shrink: 0;
-}
-
-.stepper-btn:hover:not(:disabled) {
-  background-color: rgba(255, 255, 255, 0.08);
-  color: var(--md-sys-color-primary, #8ab4f8);
-}
-
-.stepper-btn:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
-
-.stepper-input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: none;
-  outline: none;
-  font-family: 'Google Sans', sans-serif;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--md-sys-color-on-surface, #e8edf2);
-  text-align: center;
-  padding: 0;
-}
-
-.stepper-unit {
-  font-size: 11px;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  margin-right: 2px;
-  user-select: none;
-  min-width: 18px;
-  text-align: center;
-  flex-shrink: 0;
-}
-
-/* 预设灯效预览方块 (54x54px 纯净色块，与两行控件总高 54px 严格齐平) */
-.effect-preview-box {
-  width: 54px;
-  height: 54px;
-  border-radius: 4px;
-  border: 1px solid transparent;
-  background-color: #000000;
-  box-sizing: border-box;
-  flex-shrink: 0;
-  cursor: pointer;
-}
-
-/* -------------------------------------------------------------
-   下半窗口：双曲线叠加主画框区域
-   ------------------------------------------------------------- */
 .design-canvas-area {
   flex: 1;
   width: 100%;
@@ -6047,329 +6178,12 @@ defineExpose({
   overflow: hidden;
 }
 
-.design-stage > .design-view,
 .design-stage > .timeline-editor {
   position: absolute;
   inset: 0;
-  flex: 1;
   width: 100%;
   height: 100%;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
-  opacity: 1;
-  pointer-events: auto;
-  transition: opacity 180ms ease;
-  will-change: opacity;
-}
-
-.design-stage:not(.is-timeline-mode) > .timeline-editor,
-.design-stage.is-timeline-mode > .design-view {
-  opacity: 0;
-  pointer-events: none;
-}
-
-/* 曲线顶栏 */
-.curve-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 14px;
-  background-color: #1a1e27;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  flex-shrink: 0;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.tool-left-group {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-/* 双曲线切换滑块组 (Segmented Slider) */
-.curve-selector-group {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  background-color: rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 6px;
-  padding: 2px;
-  user-select: none;
-}
-
-.curve-sel-glider {
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  left: 2px;
-  width: calc(50% - 2px);
-  background-color: var(--md-sys-color-surface-container-highest, #343a46);
-  border-radius: 4px;
-  transition: transform 0.22s cubic-bezier(0.2, 0, 0, 1);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-  pointer-events: none;
-  z-index: 0;
-}
-
-.curve-sel-glider.color {
-  transform: translateX(100%);
-}
-
-.curve-sel-btn {
-  position: relative;
-  z-index: 1;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 24px;
-  padding: 0 9px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  outline: none;
-  transition: color 0.15s ease;
-}
-
-.curve-sel-btn:hover {
-  color: #ffffff;
-}
-
-.curve-sel-btn.is-active {
-  color: #ffffff;
-  font-weight: 700;
-}
-
-/* 曲线操作工具组 (鼠标、笔、添加、删除) */
-.curve-tools-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  background-color: rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 6px;
-  padding: 2px;
-  user-select: none;
-}
-
-.curve-tool-btn {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  cursor: pointer;
-  outline: none;
-  transition: all 0.15s ease;
-}
-
-.curve-tool-btn:hover {
-  color: #ffffff;
-  background-color: rgba(255, 255, 255, 0.08);
-}
-
-.curve-tool-btn.is-active {
-  color: var(--md-sys-color-primary, #8ab4f8);
-  background-color: var(--md-sys-color-surface-container-highest, #343a46);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-}
-
-.curve-tool-icon {
-  width: 14px;
-  height: 14px;
-}
-
-/* 自定义模版栏 */
-.custom-templates-group {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.templates-list {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.template-pill-btn {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 0 8px;
-  background-color: var(--md-sys-color-surface-container-highest, #2c323d);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
-  color: var(--md-sys-color-on-surface, #e8edf2);
-  font-size: 11px;
-  font-weight: 500;
-  cursor: pointer;
-  outline: none;
-  transition: all 0.12s ease;
-  white-space: nowrap;
-  user-select: none;
-}
-
-.template-pill-btn:hover:not(.is-editing) {
-  background-color: rgba(138, 180, 248, 0.18);
-  border-color: var(--md-sys-color-primary, #8ab4f8);
-  color: var(--md-sys-color-primary, #8ab4f8);
-}
-
-.template-pill-btn.is-editing {
-  padding: 0 4px 0 6px;
-  border-color: var(--md-sys-color-primary, #8ab4f8);
-  background-color: var(--md-sys-color-surface-container-highest, #2c323d);
-  cursor: default;
-  gap: 2px;
-}
-
-.template-name-input {
-  background: transparent;
-  border: none;
-  outline: none;
-  color: var(--md-sys-color-on-surface, #ffffff);
-  font-size: 11px;
-  font-weight: 500;
-  font-family: inherit;
-  height: 18px;
-  min-width: 36px;
-  max-width: 90px;
-  padding: 0 2px;
-}
-
-.del-tmpl-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 3px;
-  color: var(--md-sys-color-on-surface-variant, #aab3bf);
-  cursor: pointer;
-  transition: all 0.12s ease;
-  flex-shrink: 0;
-  margin-left: 2px;
-}
-
-.del-tmpl-btn:hover {
-  background-color: rgba(255, 82, 82, 0.2);
-  color: var(--md-sys-color-error, #f28b82);
-}
-
-.del-tmpl-btn:active {
-  transform: scale(0.92);
-}
-
-.save-tmpl-check {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 3px;
-  color: var(--md-sys-color-primary, #8ab4f8);
-  cursor: pointer;
-  transition: all 0.12s ease;
-  flex-shrink: 0;
-}
-
-.save-tmpl-check:hover {
-  background-color: rgba(138, 180, 248, 0.25);
-  color: #ffffff;
-}
-
-.save-tmpl-check:active {
-  transform: scale(0.92);
-}
-
-.tmpl-action-icon {
-  width: 13px;
-  height: 13px;
-}
-
-.tmpl-name-text {
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.save-tmpl-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border-radius: 4px;
-  background-color: rgba(168, 199, 250, 0.15);
-  border: 1px solid var(--md-sys-color-primary, #8ab4f8);
-  color: var(--md-sys-color-primary, #8ab4f8);
-  cursor: pointer;
-  outline: none;
-  transition: all 0.15s ease;
-  flex-shrink: 0;
-}
-
-.save-tmpl-btn:hover {
-  background-color: var(--md-sys-color-primary, #8ab4f8);
-  color: #12151b;
-}
-
-.save-tmpl-icon {
-  width: 14px;
-  height: 14px;
-}
-
-/* 曲线画布视口 */
-.curve-canvas-viewport {
-  flex: 1;
-  width: 100%;
-  min-height: 160px;
-  position: relative;
-  overflow: hidden;
-}
-
-.curve-canvas {
-  width: 100%;
-  height: 100%;
-  display: block;
-  touch-action: none;
-}
-
-.curve-canvas.cursor-default {
-  cursor: default;
-}
-
-.curve-canvas.cursor-pointer {
-  cursor: pointer;
-}
-
-.curve-canvas.cursor-grab {
-  cursor: grab;
-}
-
-.curve-canvas.cursor-grabbing {
-  cursor: grabbing;
-}
-
-.curve-canvas.cursor-crosshair {
-  cursor: crosshair;
 }
 
 /* -------------------------------------------------------------
@@ -6608,44 +6422,31 @@ defineExpose({
   cursor: grabbing;
 }
 
-.timeline-waveform-enter-active {
-  animation: timeline-waveform-reveal 620ms cubic-bezier(0.4, 0, 0.2, 1) both;
-}
-
-.timeline-waveform-leave-active {
-  transition:
-    opacity 160ms cubic-bezier(0.2, 0, 0, 1),
-    transform 160ms cubic-bezier(0.2, 0, 0, 1);
-}
-
-.timeline-waveform-leave-to {
-  opacity: 0;
-  transform: scale(0.985);
-}
-
-@keyframes timeline-waveform-reveal {
-  from {
-    opacity: 0.35;
-    clip-path: inset(0 100% 0 0);
-  }
-
-  to {
-    opacity: 1;
-    clip-path: inset(0 0 0 0);
-  }
+.timeline-waveform-layer {
+  position: absolute;
+  top: var(--timeline-thumbnail-lane-height);
+  left: 0;
+  width: 100%;
+  height: var(--timeline-waveform-lane-height);
+  z-index: 4;
+  pointer-events: none;
+  transform-origin: 0 0;
 }
 
 .timeline-waveform-canvas {
   position: absolute;
-  top: var(--timeline-thumbnail-lane-height);
+  top: 0;
   left: 0;
-  z-index: 4;
+  width: 100%;
+  height: 100%;
   display: block;
   background: transparent;
   pointer-events: none;
+  will-change: opacity, transform;
 }
 
 .timeline-content {
+  position: relative;
   width: 100%;
   max-width: none;
   height: 100%;
@@ -6654,6 +6455,19 @@ defineExpose({
   flex-direction: column;
   box-sizing: border-box;
   overflow: hidden;
+}
+
+.timeline-preset-drop-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 18;
+  width: 1px;
+  background-color: var(--md-sys-color-primary, #8ab4f8);
+  box-shadow: 0 0 0 0.5px rgba(138, 180, 248, 0.28);
+  pointer-events: none;
+  transform: translateX(-0.5px);
+  will-change: left;
 }
 
 .timeline-ruler {
@@ -6708,17 +6522,16 @@ defineExpose({
   text-align: center;
   white-space: nowrap;
   pointer-events: none;
-  transform: translateX(-50%);
+  transform: translateX(6px);
   transition:
-    left 120ms linear,
     opacity 120ms ease,
     transform 160ms cubic-bezier(0.2, 0, 0, 1);
+  will-change: left;
 }
 
 .timeline-drop-time-enter-active,
 .timeline-drop-time-leave-active {
   transition:
-    left 120ms linear,
     opacity 120ms ease,
     transform 160ms cubic-bezier(0.2, 0, 0, 1);
 }
@@ -6726,7 +6539,7 @@ defineExpose({
 .timeline-drop-time-enter-from,
 .timeline-drop-time-leave-to {
   opacity: 0;
-  transform: translateX(-50%) translateY(-4px);
+  transform: translateX(6px) translateY(-4px);
 }
 
 .timeline-track {
@@ -6781,7 +6594,7 @@ defineExpose({
 
 @keyframes timeline-media-reveal {
   from {
-    opacity: 0.35;
+    opacity: 0;
   }
 
   to {
@@ -6819,6 +6632,11 @@ defineExpose({
   cursor: grabbing;
 }
 
+.timeline-scroll.is-middle-panning .timeline-tracks-viewport,
+.timeline-scroll.is-middle-panning .timeline-tracks-viewport * {
+  cursor: grabbing;
+}
+
 .timeline-tracks-viewport {
   position: absolute;
   top: calc(
@@ -6843,11 +6661,32 @@ defineExpose({
   height: 0;
 }
 
+.timeline-track.is-clip-dragging .timeline-tracks-viewport {
+  z-index: 8;
+  overflow: visible;
+}
+
+.timeline-track.is-clip-dragging {
+  overflow: visible;
+}
+
 .timeline-tracks-content {
   position: relative;
   width: 100%;
   min-height: 0;
   background-color: var(--md-sys-color-surface, #1c1f26);
+}
+
+.timeline-beat-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  width: 1px;
+  background-color: var(--md-sys-color-primary, #8ab4f8);
+  opacity: 0.28;
+  pointer-events: none;
+  transform: translateX(-50%);
 }
 
 .timeline-empty-state {
@@ -6874,6 +6713,16 @@ defineExpose({
   z-index: 1;
 }
 
+.timeline-marquee {
+  position: absolute;
+  z-index: 30;
+  box-sizing: border-box;
+  border: 1px solid var(--md-sys-color-primary, #8ab4f8);
+  border-radius: 4px;
+  background-color: rgba(138, 180, 248, 0.14);
+  pointer-events: none;
+}
+
 .timeline-preset-track {
   position: relative;
   width: 100%;
@@ -6894,6 +6743,8 @@ defineExpose({
 
 .timeline-clip {
   position: absolute;
+  container-name: timeline-clip;
+  container-type: inline-size;
   top: 8px;
   bottom: 8px;
   min-width: 16px;
@@ -6901,12 +6752,15 @@ defineExpose({
   border-radius: 5px;
   background-color: color-mix(in srgb, var(--clip-color) 36%, #242a34 64%);
   cursor: grab;
-  overflow: hidden;
+  overflow: visible;
   z-index: 3;
   touch-action: none;
   user-select: none;
   transform-origin: center;
-  transition: border-color 0.12s ease, background-color 0.12s ease;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease,
+    opacity 0.12s ease;
 }
 
 .timeline-clip:hover {
@@ -6925,13 +6779,28 @@ defineExpose({
 .timeline-clip.is-dragging {
   cursor: grabbing;
   opacity: 0.58;
-  transform: scale(0.97);
   z-index: 6;
 }
 
 .timeline-clip.is-duplicating {
   pointer-events: none;
   z-index: 7;
+}
+
+.timeline-clip.is-fill-dragging {
+  cursor: ew-resize;
+  z-index: 7;
+}
+
+.timeline-clip.is-fill-remove-preview {
+  border-color: var(--md-sys-color-error, #ffb4ab);
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-error, #ffb4ab) 18%,
+    #242a34 82%
+  );
+  opacity: 0.38;
+  pointer-events: none;
 }
 
 .timeline-clip.is-removing {
@@ -7000,26 +6869,100 @@ defineExpose({
   will-change: opacity;
 }
 
-.timeline-clip-progress {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  pointer-events: none;
+.timeline-context-menu {
+  position: fixed;
+  z-index: 21000;
+  width: 196px;
+  padding: 6px;
+  border: 1px solid var(--md-sys-color-outline-variant, #3a404c);
+  border-radius: 8px;
+  background-color: var(--md-sys-color-surface-container-high, #282c35);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.28),
+    0 8px 24px rgba(0, 0, 0, 0.34);
+  color: var(--md-sys-color-on-surface, #e8edf2);
+  transform-origin: top left;
 }
 
-.timeline-clip-progress span {
-  display: block;
+.timeline-context-menu-enter-active,
+.timeline-context-menu-leave-active {
+  transition:
+    opacity 140ms cubic-bezier(0.2, 0, 0, 1),
+    transform 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.timeline-context-menu-enter-from,
+.timeline-context-menu-leave-to {
+  opacity: 0;
+  transform: scale(0.96);
+}
+
+.timeline-context-menu-item {
+  position: relative;
   width: 100%;
-  height: 100%;
-  background:
-    linear-gradient(
-      to right,
-      rgba(255, 255, 255, 0.08),
-      rgba(255, 255, 255, 0.34)
-    );
-  transform: scaleX(0);
-  transform-origin: left center;
-  will-change: transform;
+  min-height: 40px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background-color: transparent;
+  color: var(--md-sys-color-on-surface, #e8edf2);
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  outline: none;
+  overflow: hidden;
+}
+
+.timeline-context-menu-item:hover:not(:disabled),
+.timeline-context-menu-item:focus-visible:not(:disabled) {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-primary, #8ab4f8) 12%,
+    transparent
+  );
+}
+
+.timeline-context-menu-item:disabled {
+  color: var(--md-sys-color-on-surface-variant, #aab3bf);
+  cursor: default;
+  opacity: 0.38;
+}
+
+.timeline-context-menu-item svg,
+.timeline-context-menu-label,
+.timeline-context-menu-shortcut {
+  position: relative;
+  z-index: 2;
+}
+
+.timeline-context-menu-item svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+.timeline-context-menu-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-context-menu-shortcut {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant, #aab3bf);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .timeline-clip-content {
@@ -7031,7 +6974,7 @@ defineExpose({
   flex-direction: column;
   justify-content: center;
   gap: 1px;
-  padding: 4px 24px 4px 9px;
+  padding: 4px 9px;
   opacity: 1;
   pointer-events: none;
   transition: opacity 180ms ease-out;
@@ -7059,17 +7002,71 @@ defineExpose({
   white-space: nowrap;
 }
 
-.timeline-clip-remove {
+.timeline-clip-resize-handle {
   position: absolute;
-  top: 3px;
-  right: 3px;
-  width: 16px;
-  height: 16px;
+  top: 7px;
+  bottom: 7px;
+  z-index: 3;
+  width: 8px;
   padding: 0;
   border: none;
-  border-radius: 4px;
-  background-color: rgba(10, 12, 16, 0.56);
-  color: rgba(255, 255, 255, 0.86);
+  background-color: transparent;
+  opacity: 0;
+  pointer-events: none;
+  touch-action: none;
+  transition: opacity 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.timeline-clip-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 999px;
+  background-color: rgba(255, 255, 255, 0.7);
+  box-shadow: 0 0 3px rgba(0, 0, 0, 0.35);
+}
+
+.timeline-clip-resize-handle.is-start {
+  left: 0;
+  cursor: w-resize;
+}
+
+.timeline-clip-resize-handle.is-start::after {
+  left: 2px;
+}
+
+.timeline-clip-resize-handle.is-end {
+  right: 0;
+  cursor: e-resize;
+}
+
+.timeline-clip-resize-handle.is-end::after {
+  right: 2px;
+}
+
+.timeline-clip:hover .timeline-clip-resize-handle,
+.timeline-clip.is-selected .timeline-clip-resize-handle {
+  opacity: 0.72;
+  pointer-events: auto;
+}
+
+.timeline-clip-resize-handle:hover {
+  opacity: 1;
+}
+
+.timeline-clip-remove {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background-color: var(--md-sys-color-error, #ffb4ab);
+  color: var(--md-sys-color-on-error, #690005);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -7078,26 +7075,119 @@ defineExpose({
   pointer-events: none;
   z-index: 4;
   touch-action: none;
+  transition:
+    opacity 160ms cubic-bezier(0.2, 0, 0, 1),
+    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
+    color 140ms cubic-bezier(0.2, 0, 0, 1);
 }
 
-.timeline-clip:hover .timeline-clip-remove,
-.timeline-clip.is-selected .timeline-clip-remove {
+.timeline-clip:hover .timeline-clip-remove {
   opacity: 1;
   pointer-events: auto;
 }
 
 .timeline-clip-remove:hover {
-  background-color: rgba(239, 107, 115, 0.9);
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-error, #ffb4ab) 88%,
+    #ffffff
+  );
 }
 
 .timeline-clip-remove svg {
-  width: 11px;
-  height: 11px;
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+.timeline-clip-fill-preview {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  min-width: 16px;
+  box-sizing: border-box;
+  border: 1px solid color-mix(
+    in srgb,
+    var(--clip-color) 42%,
+    #596170 58%
+  );
+  border-radius: 5px;
+  background-color: color-mix(
+    in srgb,
+    var(--clip-color) 36%,
+    #242a34 64%
+  );
+  opacity: 0.5;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.timeline-clip-fill-handle {
+  position: absolute;
+  right: -7px;
+  bottom: -7px;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  box-sizing: border-box;
+  border: none;
+  border-radius: 50%;
+  background-color: var(--md-sys-color-primary, #8ab4f8);
+  color: var(--md-sys-color-on-primary, #102a43);
+  cursor: ew-resize;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 5;
+  touch-action: none;
+  transition:
+    opacity 160ms cubic-bezier(0.2, 0, 0, 1),
+    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
+    transform 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.timeline-clip:hover .timeline-clip-fill-handle,
+.timeline-clip.is-fill-dragging .timeline-clip-fill-handle {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.timeline-clip-fill-handle:hover {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-primary, #8ab4f8) 88%,
+    #ffffff
+  );
+  transform: scale(1.08);
+}
+
+.timeline-clip-fill-handle:active {
+  transform: scale(0.94);
+}
+
+.timeline-clip-fill-handle svg {
+  display: block;
+  width: 12px;
+  height: 12px;
+}
+
+@container timeline-clip (max-width: 56px) {
+  .timeline-clip-name {
+    display: none;
+  }
+}
+
+@container timeline-clip (max-width: 40px) {
+  .timeline-clip-id {
+    display: none;
+  }
 }
 
 .timeline-playhead {
   position: absolute;
-  top: -26px;
+  top: 0;
   bottom: 0;
   left: 0;
   display: none;
@@ -7106,7 +7196,7 @@ defineExpose({
   box-shadow: 0 0 0 1px rgba(138, 180, 248, 0.2);
   cursor: grab;
   pointer-events: auto;
-  z-index: 8;
+  z-index: 20;
   transform: translate3d(0, 0, 0);
   will-change: transform;
 }
@@ -7120,19 +7210,12 @@ defineExpose({
   width: 13px;
 }
 
+.timeline-playhead.is-preset-dragging {
+  pointer-events: none;
+}
+
 .timeline-playhead:active {
   cursor: grabbing;
 }
 
-.timeline-playhead-cap {
-  position: absolute;
-  top: 0;
-  left: 50%;
-  width: 9px;
-  height: 9px;
-  border-radius: 50% 50% 50% 0;
-  background-color: var(--md-sys-color-primary, #8ab4f8);
-  pointer-events: none;
-  transform: translateX(-50%) rotate(-45deg);
-}
 </style>

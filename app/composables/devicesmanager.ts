@@ -1,7 +1,11 @@
 import { computed } from 'vue'
-import type { PresetItem, PresetLightEffect, PresetPoint, PresetColorPoint } from '~/composables/presetsmanager'
-import { presetsManager } from '~/composables/presetsmanager'
 import { outputsettingsManager } from '~/composables/outputsettingsmanager'
+import {
+  normalizePresetEffect,
+  type PresetItem,
+  type PresetLightEffect,
+  type PresetPoint
+} from '~/utils/presetcurve'
 import {
   encodeSerialProtocolFrame,
   SERIAL_PROTOCOL_COLOR,
@@ -14,7 +18,11 @@ export interface DevicePlayingState {
   presetName: string
   effect: PresetLightEffect
   startedAt: number
+  playbackDurationMs: number
+  source: DevicePlaybackSource
 }
+
+export type DevicePlaybackSource = 'timeline' | 'preview'
 
 // 默认 Gamma 校正系数 (γ = 2.2，贴合人眼对可见光的非线性亮度感知)
 export const DEFAULT_GAMMA = 2.2
@@ -39,138 +47,61 @@ export const applyGamma8 = (val: number, gamma: number = DEFAULT_GAMMA): number 
   return Math.round(Math.pow(normalized, gamma) * 255)
 }
 
-// 颜色曲线插值辅助函数 (Y轴数值表示颜色的程度，依此参数进行渐变并进行 Gamma 校正)
-export const sampleCurveColor = (
-  colorPoints: PresetColorPoint[] | undefined,
-  progress: number,
-  fallbackColor: string
-): { r: number; g: number; b: number } => {
-  if (!colorPoints || colorPoints.length === 0) {
-    return hexToRgb(fallbackColor)
-  }
-  if (colorPoints.length === 1) {
-    const cp = colorPoints[0]
-    if (!cp) return hexToRgb(fallbackColor)
-
-    const degree = typeof cp.y === 'number' ? Math.max(0, Math.min(1, cp.y)) : 1.0
-    const correctedDegree = applyGamma(degree)
-    const rgb = hexToRgb(cp.color)
-    return {
-      r: Math.round(rgb.r * correctedDegree),
-      g: Math.round(rgb.g * correctedDegree),
-      b: Math.round(rgb.b * correctedDegree)
-    }
-  }
-
-  const sorted = [...colorPoints].sort((a, b) => a.x - b.x)
-  const first = sorted[0]
-  const last = sorted[sorted.length - 1]
-  if (!first || !last) return hexToRgb(fallbackColor)
-
-  if (progress <= first.x) {
-    const degree = typeof first.y === 'number' ? Math.max(0, Math.min(1, first.y)) : 1.0
-    const correctedDegree = applyGamma(degree)
-    const rgb = hexToRgb(first.color)
-    return {
-      r: Math.round(rgb.r * correctedDegree),
-      g: Math.round(rgb.g * correctedDegree),
-      b: Math.round(rgb.b * correctedDegree)
-    }
-  }
-  if (progress >= last.x) {
-    const degree = typeof last.y === 'number' ? Math.max(0, Math.min(1, last.y)) : 1.0
-    const correctedDegree = applyGamma(degree)
-    const rgb = hexToRgb(last.color)
-    return {
-      r: Math.round(rgb.r * correctedDegree),
-      g: Math.round(rgb.g * correctedDegree),
-      b: Math.round(rgb.b * correctedDegree)
-    }
-  }
-
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const cp1 = sorted[i]
-    const cp2 = sorted[i + 1]
-    if (!cp1 || !cp2) continue
-
-    if (progress >= cp1.x && progress <= cp2.x) {
-      const span = cp2.x - cp1.x
-      const y1 = typeof cp1.y === 'number' ? cp1.y : 1.0
-      const y2 = typeof cp2.y === 'number' ? cp2.y : 1.0
-      if (span <= 0.0001) {
-        const degree = Math.max(0, Math.min(1, y1))
-        const correctedDegree = applyGamma(degree)
-        const rgb = hexToRgb(cp1.color)
-        return {
-          r: Math.round(rgb.r * correctedDegree),
-          g: Math.round(rgb.g * correctedDegree),
-          b: Math.round(rgb.b * correctedDegree)
-        }
-      }
-      const t = (progress - cp1.x) / span
-      const ratio = t
-      const rgb1 = hexToRgb(cp1.color)
-      const rgb2 = hexToRgb(cp2.color)
-      const degree = Math.max(0, Math.min(1, y1 + ratio * (y2 - y1)))
-      const correctedDegree = applyGamma(degree)
-
-      const blendedR = rgb1.r + ratio * (rgb2.r - rgb1.r)
-      const blendedG = rgb1.g + ratio * (rgb2.g - rgb1.g)
-      const blendedB = rgb1.b + ratio * (rgb2.b - rgb1.b)
-
-      return {
-        r: Math.round(blendedR * correctedDegree),
-        g: Math.round(blendedG * correctedDegree),
-        b: Math.round(blendedB * correctedDegree)
-      }
-    }
-  }
-  return hexToRgb(fallbackColor)
+export interface SampledEffect {
+  color: { r: number; g: number; b: number }
+  brightness: number
 }
 
-// 曲线亮度插值辅助函数（输出经 Gamma 校正，符合人眼视觉特性）
-export const sampleCurveBrightness = (
+// 统一曲线采样：X 为时间，Y 为亮度，节点颜色为当前时刻颜色
+export const sampleEffectAtProgress = (
   points: PresetPoint[],
   progress: number,
-  gamma: number = DEFAULT_GAMMA
-): number => {
-  if (!points || points.length === 0) return 1
-  let y = 1
-  if (points.length === 1) {
-    const point = points[0]
-    if (point) {
-      y = Math.max(0, Math.min(1, point.y))
-    }
-  } else {
-    const sorted = [...points].sort((a, b) => a.x - b.x)
-    const first = sorted[0]
-    const last = sorted[sorted.length - 1]
-    if (!first || !last) return applyGamma(y, gamma)
+  fallbackColor: string
+): SampledEffect => {
+  const fallbackRgb = hexToRgb(fallbackColor)
+  if (points.length === 0) {
+    return { color: fallbackRgb, brightness: 1 }
+  }
 
-    if (progress <= first.x) {
-      y = Math.max(0, Math.min(1, first.y))
-    } else if (progress >= last.x) {
-      y = Math.max(0, Math.min(1, last.y))
-    } else {
-      for (let i = 0; i < sorted.length - 1; i++) {
-        const p1 = sorted[i]
-        const p2 = sorted[i + 1]
-        if (!p1 || !p2) continue
+  const first = points[0]
+  const last = points[points.length - 1]
+  if (!first || !last) {
+    return { color: fallbackRgb, brightness: 1 }
+  }
 
-        if (progress >= p1.x && progress <= p2.x) {
-          const span = p2.x - p1.x
-          if (span <= 0.0001) {
-            y = p1.y
-          } else {
-            const ratio = (progress - p1.x) / span
-            y = p1.y + ratio * (p2.y - p1.y)
-          }
-          break
-        }
-      }
+  const x = Math.max(0, Math.min(1, progress))
+  let left = first
+  let right = first
+  let ratio = 0
+
+  if (x >= last.x) {
+    left = last
+    right = last
+  } else if (x > first.x) {
+    for (let index = 0; index < points.length - 1; index++) {
+      const current = points[index]
+      const next = points[index + 1]
+      if (!current || !next || x < current.x || x > next.x) continue
+      left = current
+      right = next
+      const span = next.x - current.x
+      ratio = span > 0.0001 ? (x - current.x) / span : 0
+      break
     }
   }
-  return applyGamma(y, gamma)
+
+  const y = left.y + (right.y - left.y) * ratio
+  const rgb1 = hexToRgb(left.color)
+  const rgb2 = hexToRgb(right.color)
+
+  return {
+    color: {
+      r: Math.round(rgb1.r + (rgb2.r - rgb1.r) * ratio),
+      g: Math.round(rgb1.g + (rgb2.g - rgb1.g) * ratio),
+      b: Math.round(rgb1.b + (rgb2.b - rgb1.b) * ratio)
+    },
+    brightness: applyGamma(y)
+  }
 }
 
 // 十六进制颜色转 RGB
@@ -193,16 +124,18 @@ export const hexToRgb = (hex: string): { r: number; g: number; b: number } => {
 let serialPortInstance: any = null
 let serialWriterInstance: any = null
 let streamTimerInstance: any = null
+let streamSchedulerActive = false
+let streamNextFrameAt = 0
 let serialWriteInFlight = false
 let lastFrameSentAt = 0
 let smoothedFrameIntervalMs = 0
 let devicePlaybackPausedAt = 0
+let timelinePlaybackElapsedMs = 0
+let timelinePlaybackActive = false
 // 最近一次手动发送的无线数据：存在时持续发送，出现新的颜色后再切回颜色数据
 let streamWirelessPayload: Uint8Array | null = null
 
 export const devicesManager = () => {
-  const { activePreset, isPlaying, isPlaybackPaused, playTriggerTime } = presetsManager()
-
   // Web Serial 硬件连接状态
   const isSerialConnected = useState<boolean>('app_serial_connected', () => false)
   const unexpectedDisconnectToken = useState<number>(
@@ -228,6 +161,10 @@ export const devicesManager = () => {
   const devicePlayingEffect = useState<DevicePlayingState | null>('device_playing_effect', () => null)
   // 设备端播放激活状态
   const isDevicePlaying = useState<boolean>('device_is_playing', () => false)
+  const devicePlaybackSource = useState<DevicePlaybackSource | null>(
+    'device_playback_source',
+    () => null
+  )
 
   const getFrameTimestamp = () => {
     return typeof performance !== 'undefined' ? performance.now() : Date.now()
@@ -300,74 +237,67 @@ export const devicesManager = () => {
     let g = lastActiveColor.value.g
     let b = lastActiveColor.value.b
 
-    // 优先采用活跃播放中的效果参数
-    const targetEffect = !isPlaybackPaused.value
-      ? isDevicePlaying.value && devicePlayingEffect.value?.effect
-        ? devicePlayingEffect.value.effect
-        : isPlaying.value && activePreset.value?.effect
-          ? activePreset.value.effect
-          : null
+    // 统一采样设备播放状态，时间线与预设预览均通过该状态下发。
+    const playbackState = devicePlayingEffect.value
+    const targetEffect = isDevicePlaying.value
+      ? playbackState?.effect
       : null
 
-    if (targetEffect) {
-      const duration = Math.max(50, targetEffect.duration ?? 500)
-      const repeat = typeof targetEffect.repeat === 'number' ? targetEffect.repeat : 1
+    if (targetEffect && playbackState) {
+      const source = playbackState.source
+      const effectDuration = Math.max(50, targetEffect.duration ?? 500)
+      const playbackDuration = playbackState.playbackDurationMs
+      const timelineDuration = source === 'timeline' && Number.isFinite(playbackDuration)
+        ? Math.max(50, Math.round(Number(playbackDuration)))
+        : null
+      const duration = timelineDuration ?? effectDuration
+      const repeat = timelineDuration !== null
+        ? 1
+        : (typeof targetEffect.repeat === 'number' ? targetEffect.repeat : 1)
       const isInfinite = repeat === 0
-      const totalDuration = duration * (isInfinite ? 1 : repeat)
+      const totalDuration = timelineDuration
+        ?? playbackDuration
+        ?? duration * (isInfinite ? 1 : repeat)
 
-      const now = Date.now()
-      const startTime = isDevicePlaying.value && devicePlayingEffect.value?.startedAt
-        ? devicePlayingEffect.value.startedAt
-        : (playTriggerTime.value || now)
+      const now = devicePlaybackPausedAt > 0
+        ? devicePlaybackPausedAt
+        : getFrameTimestamp()
+      const startTime = Number.isFinite(playbackState.startedAt)
+        ? playbackState.startedAt
+        : now
 
-      const totalElapsed = now - startTime + wirelessDelayCompensation.value
+      // 时间线进度由事件同步器显式提供，避免独立时钟漂移造成颜色跳变。
+      const playbackElapsed = source === 'timeline' && timelinePlaybackActive
+        ? timelinePlaybackElapsedMs
+        : Math.max(0, now - startTime)
+      const compensatedElapsed = playbackElapsed + wirelessDelayCompensation.value
+      const playbackFinished = !isInfinite && playbackElapsed >= totalDuration
+      const cycleElapsed = ((compensatedElapsed % duration) + duration) % duration
+      const progress = playbackFinished
+        ? 1
+        : Math.max(0, Math.min(1, cycleElapsed / duration))
+      const sampled = sampleEffectAtProgress(
+        targetEffect.points,
+        progress,
+        targetEffect.color
+      )
 
-      if (!isInfinite && totalElapsed >= totalDuration) {
-        // 重复次数已满：最后必须严格采样曲线终点帧 (progress = 1.0)，确保终点颜色与亮度完全呈现，严禁吞色
-        const brightness = sampleCurveBrightness(targetEffect.points, 1.0)
-        const currentRgb = sampleCurveColor(targetEffect.colorPoints, 1.0, targetEffect.color)
+      r = Math.round(sampled.color.r * sampled.brightness)
+      g = Math.round(sampled.color.g * sampled.brightness)
+      b = Math.round(sampled.color.b * sampled.brightness)
 
-        r = Math.round(currentRgb.r * brightness)
-        g = Math.round(currentRgb.g * brightness)
-        b = Math.round(currentRgb.b * brightness)
+      const hexR = r.toString(16).padStart(2, '0')
+      const hexG = g.toString(16).padStart(2, '0')
+      const hexB = b.toString(16).padStart(2, '0')
+      lastActiveColor.value = {
+        r,
+        g,
+        b,
+        hex: `#${hexR}${hexG}${hexB}`
+      }
 
-        const hexR = r.toString(16).padStart(2, '0')
-        const hexG = g.toString(16).padStart(2, '0')
-        const hexB = b.toString(16).padStart(2, '0')
-        lastActiveColor.value = {
-          r,
-          g,
-          b,
-          hex: `#${hexR}${hexG}${hexB}`
-        }
-
-        // 停止动态播放状态
-        if (isDevicePlaying.value) {
-          isDevicePlaying.value = false
-        }
-        if (isPlaying.value) {
-          isPlaying.value = false
-        }
-      } else {
-        // 在有效单次或多次周期内，按波形曲线采样发光
-        const cycleElapsed = totalElapsed % duration
-        const progress = Math.max(0, Math.min(1, cycleElapsed / duration))
-        const brightness = sampleCurveBrightness(targetEffect.points, progress)
-        const currentRgb = sampleCurveColor(targetEffect.colorPoints, progress, targetEffect.color)
-
-        r = Math.round(currentRgb.r * brightness)
-        g = Math.round(currentRgb.g * brightness)
-        b = Math.round(currentRgb.b * brightness)
-
-        const hexR = r.toString(16).padStart(2, '0')
-        const hexG = g.toString(16).padStart(2, '0')
-        const hexB = b.toString(16).padStart(2, '0')
-        lastActiveColor.value = {
-          r,
-          g,
-          b,
-          hex: `#${hexR}${hexG}${hexB}`
-        }
+      if (playbackFinished) {
+        isDevicePlaying.value = false
       }
     } else {
       // 未播放动态灯效时：保持最后一个颜色（没有颜色时默认颜色为黑色）
@@ -413,24 +343,58 @@ export const devicesManager = () => {
     return true
   }
 
-  // 启动高频持续流式发射定时器 (~46.5 ms 周期，约 21.5 FPS)
+  const runHighPriorityTask = (task: () => void) => {
+    const scheduler = (globalThis as any).scheduler
+    if (scheduler && typeof scheduler.postTask === 'function') {
+      try {
+        void scheduler.postTask(task, { priority: 'user-blocking' })
+        return
+      } catch {}
+    }
+    setTimeout(task, 0)
+  }
+
+  const scheduleStreamFrame = () => {
+    if (!streamSchedulerActive) return
+
+    const delay = Math.max(0, streamNextFrameAt - getFrameTimestamp())
+    streamTimerInstance = setTimeout(() => {
+      streamTimerInstance = null
+      if (!streamSchedulerActive) return
+
+      const now = getFrameTimestamp()
+      streamNextFrameAt += 46
+      if (streamNextFrameAt <= now) {
+        streamNextFrameAt = now + 46
+      }
+
+      runHighPriorityTask(() => {
+        if (streamSchedulerActive) {
+          void sendCurrentFrameToSerial()
+        }
+      })
+      scheduleStreamFrame()
+    }, delay)
+  }
+
+  // 启动高优先级、漂移校正的颜色流式发送调度器。
   const startStreaming = () => {
-    if (streamTimerInstance) return
+    if (streamSchedulerActive) return
+
+    streamSchedulerActive = true
+    streamNextFrameAt = getFrameTimestamp()
     isRfStreaming.value = true
     lastFrameSentAt = 0
     smoothedFrameIntervalMs = 0
     rfTxFps.value = 0
-
-    // 每 46.5 ms 产生并发射一帧
-    streamTimerInstance = setInterval(() => {
-      void sendCurrentFrameToSerial()
-    }, 46)
+    scheduleStreamFrame()
   }
 
   // 停止流式发射
   const stopStreaming = () => {
+    streamSchedulerActive = false
     if (streamTimerInstance) {
-      clearInterval(streamTimerInstance)
+      clearTimeout(streamTimerInstance)
       streamTimerInstance = null
     }
     isRfStreaming.value = false
@@ -505,6 +469,7 @@ export const devicesManager = () => {
     isSerialConnected.value = false
     serialPortInfo.value = ''
     isDevicePlaying.value = false
+    devicePlaybackSource.value = null
 
     if (options.unexpected && wasConnected) {
       unexpectedDisconnectToken.value += 1
@@ -512,51 +477,55 @@ export const devicesManager = () => {
   }
 
   // 同步发送预设效果至设备（若设备已连接则下发硬件；不自动连接设备，连接只能在设备管理器中手动操作）
-  const sendPresetToDevice = (preset: PresetItem | null) => {
+  const sendPresetToDevice = (
+    preset: PresetItem | null,
+    playbackDurationMs?: number,
+    source: DevicePlaybackSource = 'timeline',
+    initialElapsedMs = 0
+  ) => {
     if (!preset) return false
+    if (
+      source === 'preview' &&
+      devicePlaybackSource.value === 'timeline' &&
+      isDevicePlaying.value &&
+      devicePlaybackPausedAt <= 0
+    ) {
+      return false
+    }
 
     // 出现新的颜色：结束指令持续发送，切回颜色数据
     streamWirelessPayload = null
     currentWirelessData.value = ''
     devicePlaybackPausedAt = 0
 
-    const effectData: PresetLightEffect = preset.effect
-      ? JSON.parse(JSON.stringify(preset.effect))
-      : {
-          color: '#ffffff',
-          colorPoints: [
-            { x: 0, y: 1.0, color: '#ffffff' },
-            { x: 1, y: 1.0, color: '#ffffff' }
-          ],
-          repeat: 1,
-          duration: 500,
-          points: [
-            { x: 0, y: 0.5 },
-            { x: 1, y: 0.5 }
-          ]
-        }
+    const effectData: PresetLightEffect = normalizePresetEffect(preset.effect)
+    timelinePlaybackActive = source === 'timeline'
+    timelinePlaybackElapsedMs = timelinePlaybackActive
+      ? Math.max(0, initialElapsedMs)
+      : 0
 
     devicePlayingEffect.value = {
       presetId: preset.id,
       presetName: preset.name,
       effect: effectData,
-      startedAt: Date.now()
+      startedAt: getFrameTimestamp(),
+      playbackDurationMs: Number.isFinite(playbackDurationMs)
+        ? Math.max(50, Math.round(Number(playbackDurationMs)))
+        : effectData.duration * (
+            effectData.repeat === 0 ? 1 : Math.max(1, effectData.repeat)
+          ),
+      source
     }
+    devicePlaybackSource.value = source
 
     // 仅在设备已被用户手动连接时激活硬件播放
     if (hasConnectedDevice.value) {
       isDevicePlaying.value = true
 
-      // 重启并重置流式发射定时器相位，确保以严格 46ms 间隔自 0ms 均匀下发，杜绝与原有背景定时器相位错位导致的丢帧
+      // 保持连续发送节奏，切换效果时不重建调度器。
       if (isSerialConnected.value) {
-        if (streamTimerInstance) {
-          clearInterval(streamTimerInstance)
-          streamTimerInstance = null
-        }
+        startStreaming()
         void sendCurrentFrameToSerial()
-        streamTimerInstance = setInterval(() => {
-          void sendCurrentFrameToSerial()
-        }, 46)
       }
     } else {
       isDevicePlaying.value = false
@@ -565,34 +534,55 @@ export const devicesManager = () => {
     return true
   }
 
-  const stopDevicePlayback = () => {
+  const stopDevicePlayback = (source: DevicePlaybackSource = 'timeline') => {
+    if (devicePlaybackSource.value !== source) return
     isDevicePlaying.value = false
     devicePlaybackPausedAt = 0
+    devicePlaybackSource.value = null
+    if (source === 'timeline') {
+      timelinePlaybackActive = false
+      timelinePlaybackElapsedMs = 0
+    }
   }
 
-  const pauseDevicePlayback = () => {
+  const syncDevicePlaybackTime = (
+    elapsedMs: number,
+    source: DevicePlaybackSource = 'timeline'
+  ) => {
+    if (devicePlaybackSource.value !== source || !Number.isFinite(elapsedMs)) {
+      return
+    }
+
+    timelinePlaybackActive = true
+    timelinePlaybackElapsedMs = Math.max(0, elapsedMs)
+  }
+
+  const pauseDevicePlayback = (source: DevicePlaybackSource = 'timeline') => {
+    if (devicePlaybackSource.value !== source) return
     if (devicePlaybackPausedAt > 0) return
-    devicePlaybackPausedAt = Date.now()
+    devicePlaybackPausedAt = getFrameTimestamp()
   }
 
-  const resumeDevicePlayback = () => {
+  const resumeDevicePlayback = (source: DevicePlaybackSource = 'timeline') => {
+    if (devicePlaybackSource.value !== source) return
     if (devicePlaybackPausedAt <= 0) return
 
-    const pausedDuration = Date.now() - devicePlaybackPausedAt
+    const pausedDuration = getFrameTimestamp() - devicePlaybackPausedAt
     if (devicePlayingEffect.value) {
       devicePlayingEffect.value = {
         ...devicePlayingEffect.value,
         startedAt: devicePlayingEffect.value.startedAt + pausedDuration
       }
     }
-    if (playTriggerTime.value > 0) {
-      playTriggerTime.value += pausedDuration
-    }
     devicePlaybackPausedAt = 0
   }
 
-  const seekDevicePlayback = (elapsedMs: number) => {
-    const now = Date.now()
+  const seekDevicePlayback = (
+    elapsedMs: number,
+    source: DevicePlaybackSource = 'timeline'
+  ) => {
+    if (devicePlaybackSource.value !== source) return
+    const now = getFrameTimestamp()
     const elapsed = Math.max(0, elapsedMs)
 
     if (devicePlayingEffect.value) {
@@ -601,7 +591,6 @@ export const devicesManager = () => {
         startedAt: now - elapsed
       }
     }
-    playTriggerTime.value = now - elapsed
     if (devicePlaybackPausedAt > 0) {
       devicePlaybackPausedAt = now
     }
@@ -641,11 +630,13 @@ export const devicesManager = () => {
     lastActiveColor,
     devicePlayingEffect,
     isDevicePlaying,
+    devicePlaybackSource,
     hasConnectedDevice,
     connectedCount,
     connectSerial,
     disconnectSerial,
     sendPresetToDevice,
+    syncDevicePlaybackTime,
     stopDevicePlayback,
     pauseDevicePlayback,
     resumeDevicePlayback,

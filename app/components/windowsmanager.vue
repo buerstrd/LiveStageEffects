@@ -16,7 +16,7 @@ import ProjectManagerContent from '~/components/projectmanagercontent.vue'
 import VideoContent from '~/components/videocontent.vue'
 import TerminalContent from '~/components/terminalcontent.vue'
 import WindowTitle from '~/components/windowtitle.vue'
-import { devicesManager } from '~/composables/devicesmanager'
+import { useRealtimeBpm } from '~/composables/bpmanalyzer'
 import { eventsManager } from '~/composables/eventsmanager'
 import { presetsManager } from '~/composables/presetsmanager'
 import { videoManager } from '~/composables/videomanager'
@@ -26,7 +26,6 @@ const {
   windows,
   maxZIndex,
   focusedWindowId,
-  designViewMode,
   timelineFollowEnabled,
   focusWindow,
   closeWindow,
@@ -44,25 +43,16 @@ const {
   isEventRecording,
   toggleEventRecording,
   addEvent,
+  addEventPreset,
   addEventTimelineTrack,
   removeEventTimelineTrack,
   stopEventEffect
 } = eventsManager()
 const {
-  presets,
-  addPreset,
-  activePreset,
-  isPlaying,
-  togglePlay,
-  triggerPlaySync,
-  updatePresetEffect
+  editingPresetId
 } = presetsManager()
-const {
-  devicePlayingEffect,
-  isDevicePlaying,
-  sendPresetToDevice,
-  stopDevicePlayback
-} = devicesManager()
+const { resetBeatGridAnalysis } = useRealtimeBpm()
+const isPresetCurveEditing = computed(() => editingPresetId.value !== null)
 const {
   videoTitle,
   videoSrc,
@@ -84,18 +74,12 @@ const {
 
 const getWindowTitle = (win: WindowItem) => {
   if (win.type === 'design') {
-    if (designViewMode.value === 'timeline') {
-      const selectedEvent = selectedEventId.value === null
-        ? null
-        : events.value.find(event => event.id === selectedEventId.value)
-      return selectedEvent
-        ? `设计 - ${selectedEvent.name || '事件'}`
-        : '设计 - 事件'
-    }
-    if (activePreset.value) {
-      return `设计 - ${activePreset.value.name}`
-    }
-    return '设计 - 预设'
+    const selectedEvent = selectedEventId.value === null
+      ? null
+      : events.value.find(event => event.id === selectedEventId.value)
+    return selectedEvent
+      ? `设计 - ${selectedEvent.name || '事件'}`
+      : '设计'
   }
   if (win.type === 'video') {
     return videoTitle.value
@@ -109,11 +93,15 @@ const getWindowTitleMeasureText = (win: WindowItem) => {
   return title.replace(/\d/g, '0')
 }
 
-const hasDesignSelection = computed(() => (
-  designViewMode.value === 'timeline'
-    ? selectedEventId.value !== null
-    : activePreset.value !== null
-))
+const hasDesignSelection = computed(() => selectedEventId.value !== null)
+
+const handleResetBeatGrid = (win: WindowItem) => {
+  if (win.isCollapsed) {
+    win.isCollapsed = false
+  }
+  focusWindow(win.id)
+  resetBeatGridAnalysis()
+}
 
 const handleToggleVideoPlay = (win: WindowItem) => {
   if (win.isCollapsed) {
@@ -246,11 +234,13 @@ const handleToggleTimelineFollow = (win: WindowItem) => {
 }
 
 const handleAddPreset = (win: WindowItem) => {
+  if (isPresetCurveEditing.value) return
   if (win.isCollapsed) {
     win.isCollapsed = false
   }
   focusWindow(win.id)
-  addPreset()
+  if (selectedEventId.value === null) return
+  addEventPreset(selectedEventId.value)
 }
 
 const handleAddEvent = (win: WindowItem) => {
@@ -259,54 +249,6 @@ const handleAddEvent = (win: WindowItem) => {
   }
   focusWindow(win.id)
   addEvent()
-}
-
-const handleTogglePlay = (win: WindowItem) => {
-  if (win.isCollapsed) {
-    win.isCollapsed = false
-  }
-  focusWindow(win.id)
-  togglePlay()
-  if (!isPlaying.value) {
-    stopDevicePlayback()
-  } else if (devicePlayingEffect.value?.presetId === activePreset.value?.id) {
-    isDevicePlaying.value = true
-  }
-}
-
-const handleSendToDevice = (win: WindowItem) => {
-  if (win.isCollapsed) {
-    win.isCollapsed = false
-  }
-  focusWindow(win.id)
-
-  if (!activePreset.value) return
-
-  // 1. 同步发送预设效果至设备
-  sendPresetToDevice(activePreset.value)
-
-  // 2. 触发预览播放（若已在播放则从头重启），保证屏幕预览与设备播放完全同步
-  triggerPlaySync()
-}
-
-const designContentRef = ref<any>(null)
-
-const handlePickColor = async (win: WindowItem) => {
-  if (win.isCollapsed) {
-    win.isCollapsed = false
-  }
-  focusWindow(win.id)
-  if (designContentRef.value?.pickScreenColor) {
-    designContentRef.value.pickScreenColor()
-  } else if (typeof window !== 'undefined' && 'EyeDropper' in window) {
-    try {
-      const eyeDropper = new (window as any).EyeDropper()
-      const result = await eyeDropper.open()
-      if (result?.sRGBHex && activePreset.value) {
-        updatePresetEffect(activePreset.value.id, { color: result.sRGBHex.toLowerCase() })
-      }
-    } catch {}
-  }
 }
 
 const SNAP_THRESHOLD = 14
@@ -1349,7 +1291,7 @@ const handleCloseWindow = (win: WindowItem) => {
               fill="currentColor"
             >
               <path
-                d="M160-160q-33 0-56.5-23.5T80-240v-480q0-33 23.5-56.5T160-800h640q33 0 56.5 23.5T880-720v480q0 33-23.5 56.5T880-160H160Zm0-80h640v-480H160v480Zm0 0v-480 480Zm120-80h240v-80H280v80Zm-36-156 116-116-116-116 56-56 172 172-172 172-56-56Z"
+                d="M260-120q-58 0-99-41t-41-99q0-58 41-99t99-41h60v-160h-60q-58 0-99-41t-41-99q0-58 41-99t99-41q58 0 99 41t41 99v60h160v-60q0-58 41-99t99-41q58 0 99 41t41 99q0 58-41 99t-99 41h-60v160h60q58 0 99 41t41 99q0 58-41 99t-99 41q-58 0-99-41t-41-99v-60H400v60q0 58-41 99t-99 41Zm0-80q25 0 42.5-17.5T320-260v-60h-60q-25 0-42.5 17.5T200-260q0 25 17.5 42.5T260-200Zm440 0q25 0 42.5-17.5T760-260q0-25-17.5-42.5T700-320h-60v60q0 25 17.5 42.5T700-200ZM400-400h160v-160H400v160ZM260-640h60v-60q0-25-17.5-42.5T260-760q-25 0-42.5 17.5T200-700q0 25 17.5 42.5T260-640Zm380 0h60q25 0 42.5-17.5T760-700q0-25-17.5-42.5T700-760q-25 0-42.5 17.5T640-700v60Z"
               />
             </svg>
             <WindowTitle
@@ -1498,6 +1440,7 @@ const handleCloseWindow = (win: WindowItem) => {
                 class="header-action-btn"
                 type="button"
                 aria-label="添加预设"
+                :disabled="isPresetCurveEditing || selectedEventId === null"
                 @pointerdown.stop
                 @dblclick.stop
                 @click.stop="handleAddPreset(win)"
@@ -1542,101 +1485,72 @@ const handleCloseWindow = (win: WindowItem) => {
                 </svg>
               </button>
 
-              <!-- 设计窗口按当前模式切换的按钮组 -->
-              <Transition name="design-toolbar-action" mode="out-in">
-                <div
-                  v-if="win.type === 'design' && hasDesignSelection"
-                  :key="designViewMode"
-                  class="design-mode-actions"
+              <!-- 设计窗口时间线操作 -->
+              <div
+                v-if="win.type === 'design' && hasDesignSelection"
+                class="design-mode-actions"
+              >
+                <!-- 重置BPM提示线并重新识别 -->
+                <button
+                  class="header-action-btn"
+                  type="button"
+                  aria-label="重置BPM提示线"
+                  title="重置BPM提示线"
+                  @pointerdown.stop
+                  @dblclick.stop
+                  @click.stop="handleResetBeatGrid(win)"
                 >
-                  <template v-if="designViewMode === 'timeline'">
-                    <!-- 添加时间线轨道 -->
-                    <button
-                      class="header-action-btn"
-                      type="button"
-                      aria-label="添加时间线轨道"
-                      :disabled="selectedEventId === null"
-                      @pointerdown.stop
-                      @dblclick.stop
-                      @click.stop="handleAddTimelineTrack(win)"
-                    >
-                      <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M14 10H2v2h12v-2zm0-4H2v2h12V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM2 16h8v-2H2v2z" />
-                      </svg>
-                    </button>
+                  <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M17.65 6.35A7.95 7.95 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+                  </svg>
+                </button>
 
-                    <!-- 删除最后一条时间线轨道 -->
-                    <button
-                      class="header-action-btn"
-                      type="button"
-                      aria-label="删除最后一条时间线轨道"
-                      :disabled="selectedEventId === null || !(events.find(event => event.id === selectedEventId)?.timelineTrackCount)"
-                      @pointerdown.stop
-                      @dblclick.stop
-                      @click.stop="handleRemoveTimelineTrack(win)"
-                    >
-                      <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M14 10H2v2h12v-2zm0-4H2v2h12V6zM2 16h8v-2H2v2zm19-2v-2h-8v2h8z" />
-                      </svg>
-                    </button>
+                <!-- 添加时间线轨道 -->
+                <button
+                  class="header-action-btn"
+                  type="button"
+                  aria-label="添加时间线轨道"
+                  :disabled="selectedEventId === null"
+                  @pointerdown.stop
+                  @dblclick.stop
+                  @click.stop="handleAddTimelineTrack(win)"
+                >
+                  <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M14 10H2v2h12v-2zm0-4H2v2h12V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM2 16h8v-2H2v2z" />
+                  </svg>
+                </button>
 
-                    <!-- 录制当前事件时间线 -->
-                    <button
-                      class="header-action-btn"
-                      :class="{ 'is-recording': isEventRecording }"
-                      type="button"
-                      :aria-label="isEventRecording ? '停止录制事件' : '开始录制事件'"
-                      :disabled="selectedEventId === null"
-                      @pointerdown.stop
-                      @dblclick.stop
-                      @click.stop="handleToggleEventRecording(win)"
-                    >
-                      <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                        <circle cx="12" cy="12" r="5" />
-                      </svg>
-                    </button>
-                  </template>
+                <!-- 删除最后一条时间线轨道 -->
+                <button
+                  class="header-action-btn"
+                  type="button"
+                  aria-label="删除最后一条时间线轨道"
+                  :disabled="selectedEventId === null || !(events.find(event => event.id === selectedEventId)?.timelineTrackCount)"
+                  @pointerdown.stop
+                  @dblclick.stop
+                  @click.stop="handleRemoveTimelineTrack(win)"
+                >
+                  <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M14 10H2v2h12v-2zm0-4H2v2h12V6zM2 16h8v-2H2v2zm19-2v-2h-8v2h8z" />
+                  </svg>
+                </button>
 
-                  <template v-else>
-                    <!-- 预览播放 -->
-                    <button
-                      class="header-action-btn"
-                      type="button"
-                      :aria-label="isPlaying ? '暂停预览' : '播放预览'"
-                      :disabled="!activePreset"
-                      @pointerdown.stop
-                      @dblclick.stop
-                      @click.stop="handleTogglePlay(win)"
-                    >
-                      <svg v-if="!isPlaying" class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                        <path
-                          d="M22 12C22 6.46 17.54 2 12 2C10.83 2 9.7 2.19 8.62 2.56L9.32 4.5C10.17 4.16 11.06 3.97 12 3.97C16.41 3.97 20.03 7.59 20.03 12C20.03 16.41 16.41 20.03 12 20.03C7.59 20.03 3.97 16.41 3.97 12C3.97 11.06 4.16 10.12 4.5 9.28L2.56 8.62C2.19 9.7 2 10.83 2 12C2 17.54 6.46 22 12 22C17.54 22 22 17.54 22 12M5.47 3.97C6.32 3.97 7 4.68 7 5.47C7 6.32 6.32 7 5.47 7C4.68 7 3.97 6.32 3.97 5.47C3.97 4.68 4.68 3.97 5.47 3.97M18 12C18 8.67 15.33 6 12 6C8.67 6 6 8.67 6 12C6 15.33 8.67 18 12 18C15.33 18 18 15.33 18 12M15 12L10 15V9"
-                        />
-                      </svg>
-                      <svg v-else class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                        <path
-                          d="M22 12C22 6.46 17.54 2 12 2C10.83 2 9.7 2.19 8.62 2.56L9.32 4.5C10.17 4.16 11.06 3.97 12 3.97C16.41 3.97 20.03 7.59 20.03 12C20.03 16.41 16.41 20.03 12 20.03C7.59 20.03 3.97 16.41 3.97 12C3.97 11.06 4.16 10.12 4.5 9.28L2.56 8.62C2.19 9.7 2 10.83 2 12C2 17.54 6.46 22 12 22C17.54 22 22 17.54 22 12M5.47 3.97C6.32 3.97 7 4.68 7 5.47C7 6.32 6.32 7 5.47 7C4.68 7 3.97 6.32 3.97 5.47C3.97 4.68 4.68 3.97 5.47 3.97M18 12C18 8.67 15.33 6 12 6C8.67 6 6 8.67 6 12C6 15.33 8.67 18 12 18C15.33 18 18 15.33 18 12M11 9V15H9V9M15 9V15H13V9"
-                        />
-                      </svg>
-                    </button>
-
-                    <!-- 发送到设备播放 -->
-                    <button
-                      class="header-action-btn"
-                      type="button"
-                      :aria-label="activePreset ? '发送到设备播放' : '未选择预设'"
-                      :disabled="!activePreset"
-                      @pointerdown.stop
-                      @dblclick.stop
-                      @click.stop="handleSendToDevice(win)"
-                    >
-                      <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
-                      </svg>
-                    </button>
-                  </template>
-                </div>
-              </Transition>
+                <!-- 录制当前事件时间线 -->
+                <button
+                  class="header-action-btn"
+                  :class="{ 'is-recording': isEventRecording }"
+                  type="button"
+                  :aria-label="isEventRecording ? '停止录制事件' : '开始录制事件'"
+                  :disabled="selectedEventId === null"
+                  @pointerdown.stop
+                  @dblclick.stop
+                  @click.stop="handleToggleEventRecording(win)"
+                >
+                  <svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <circle cx="12" cy="12" r="5" />
+                  </svg>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1733,7 +1647,7 @@ const handleCloseWindow = (win: WindowItem) => {
           <PresetsContent v-else-if="win.type === 'presets'" />
           <EventsContent v-else-if="win.type === 'events'" />
           <ProjectManagerContent v-else-if="win.type === 'project-manager'" />
-          <DesignContent v-else-if="win.type === 'design'" :ref="(el: any) => { if (el) designContentRef = el }" />
+          <DesignContent v-else-if="win.type === 'design'" />
           <VideoContent v-else-if="win.type === 'video'" />
           <TerminalContent v-else-if="win.type === 'terminal'" />
         </div>
@@ -2002,7 +1916,7 @@ const handleCloseWindow = (win: WindowItem) => {
   gap: 4px;
 }
 
-/* 标题栏操作按钮（如事件添加按钮、预设添加、吸色、预览播放、发送到设备） */
+/* 标题栏操作按钮（如事件添加按钮、预设添加、吸色、预览播放） */
 .header-action-btn {
   position: relative;
   overflow: hidden;

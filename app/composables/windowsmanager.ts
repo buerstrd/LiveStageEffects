@@ -1,5 +1,4 @@
 import { computed } from 'vue'
-import { eventsManager } from '~/composables/eventsmanager'
 
 export interface WindowItem {
   id: string
@@ -33,8 +32,6 @@ export type WorkspaceQuadrantWindowId =
   | 'win-design'
 
 export type WorkspaceQuadrant = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
-
-export type DesignViewMode = 'curve' | 'timeline'
 
 const getWorkspaceSize = () => {
   let width = 1280
@@ -129,10 +126,8 @@ let closeFocusTimer: ReturnType<typeof setTimeout> | null = null
 let projectManagerCloseSequence = 0
 
 export const windowsManager = () => {
-  const { isEventRecording } = eventsManager()
   const maxZIndex = useState<number>('max_window_z_index', () => 10)
   const focusedWindowId = useState<string | null>('focused_window_id', () => null)
-  const designViewMode = useState<DesignViewMode>('app_design_view_mode', () => 'curve')
   const timelineFollowEnabled = useState<boolean>(
     'design_timeline_follow_enabled',
     () => true
@@ -155,10 +150,6 @@ export const windowsManager = () => {
 
   const requestResetWorkspaceLayout = () => {
     resetWorkspaceLayoutRequest.value += 1
-  }
-
-  const setDesignViewMode = (mode: DesignViewMode) => {
-    designViewMode.value = mode
   }
 
   const setTimelineFollowEnabled = (enabled: boolean) => {
@@ -212,12 +203,6 @@ export const windowsManager = () => {
       clearTimeout(closeFocusTimer)
       closeFocusTimer = null
       closingWindowId.value = null
-    }
-
-    if (id === 'win-events') {
-      setDesignViewMode('timeline')
-    } else if (id === 'win-presets' && !isEventRecording.value) {
-      setDesignViewMode('curve')
     }
 
     focusedWindowId.value = id
@@ -548,9 +533,7 @@ export const windowsManager = () => {
     windows,
     maxZIndex,
     focusedWindowId,
-    designViewMode,
     timelineFollowEnabled,
-    setDesignViewMode,
     setTimelineFollowEnabled,
     toggleTimelineFollow,
     closingWindowId,

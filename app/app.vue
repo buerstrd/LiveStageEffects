@@ -1,19 +1,313 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { settingsManager } from '~/composables/settingsmanager'
 import { bpmAnalyzer } from '~/composables/bpmanalyzer'
 import { statusBarNoticeManager } from '~/composables/statusbarnotice'
+import { clearBrowserCache } from '~/utils/browsercache'
 
-const { disableAnimations } = settingsManager()
+const { clearBrowserCacheOnStartup } = settingsManager()
 const { showStatusBarNotice } = statusBarNoticeManager()
 bpmAnalyzer()
+
+if (import.meta.client && clearBrowserCacheOnStartup.value) {
+  void clearBrowserCache()
+}
 
 const isStatusBarVisible = ref(false)
 let statusBarRevealTimer: ReturnType<typeof setTimeout> | null = null
 let betaNoticeTimer: ReturnType<typeof setTimeout> | null = null
 
+const tooltipControlSelector = [
+  'button',
+  '[role="button"]',
+  '[role="switch"]',
+  '[data-tooltip]',
+  '.md3-ripple-surface'
+].join(', ')
+const tooltipDelay = 500
+const tooltipGap = 8
+const tooltipViewportPadding = 8
+
+const tooltipElement = ref<HTMLElement | null>(null)
+const tooltipVisible = ref(false)
+const tooltipPositioned = ref(false)
+const tooltipText = ref('')
+const tooltipStyle = ref<Record<string, string>>({})
+
+let tooltipTarget: HTMLElement | null = null
+let pendingTooltipTarget: HTMLElement | null = null
+let tooltipShowTimer: ReturnType<typeof setTimeout> | null = null
+let tooltipOriginalTitle: string | null = null
+let tooltipHadNativeTitle = false
+
 const handleContextMenu = (e: MouseEvent) => {
   e.preventDefault()
+}
+
+const findTooltipControl = (event: Event) => {
+  for (const node of event.composedPath()) {
+    if (node instanceof HTMLElement && node.matches(tooltipControlSelector)) {
+      return node
+    }
+  }
+
+  return null
+}
+
+const findTooltipControlFromTarget = (target: EventTarget | null) => {
+  if (!(target instanceof Element)) return null
+  return target.closest<HTMLElement>(tooltipControlSelector)
+}
+
+const normalizeTooltipText = (value: string | null | undefined) => {
+  return value?.replace(/\s+/g, ' ').trim() ?? ''
+}
+
+const getLabelledByText = (control: HTMLElement) => {
+  const ids = control.getAttribute('aria-labelledby')?.split(/\s+/).filter(Boolean) ?? []
+  if (ids.length === 0) return ''
+
+  return normalizeTooltipText(
+    ids
+      .map((id) => document.getElementById(id)?.textContent)
+      .filter(Boolean)
+      .join(' ')
+  )
+}
+
+const resolveTooltipText = (control: HTMLElement) => {
+  const explicitText = normalizeTooltipText(control.getAttribute('data-tooltip'))
+  if (explicitText) return explicitText
+
+  const titleText = normalizeTooltipText(control.getAttribute('title'))
+  if (titleText) return titleText
+
+  const ariaLabel = normalizeTooltipText(control.getAttribute('aria-label'))
+  if (ariaLabel) return ariaLabel
+
+  const labelledByText = getLabelledByText(control)
+  if (labelledByText) return labelledByText
+
+  if (control.getAttribute('role') === 'switch') {
+    const context = control.closest<HTMLElement>('.setting-item-row, .serial-setting-row')
+    const contextText = normalizeTooltipText(context?.innerText || context?.textContent)
+    if (contextText) return contextText
+  }
+
+  return normalizeTooltipText(control.innerText || control.textContent)
+}
+
+const clearTooltipShowTimer = () => {
+  if (tooltipShowTimer) {
+    clearTimeout(tooltipShowTimer)
+    tooltipShowTimer = null
+  }
+}
+
+const restoreNativeTooltipTitle = () => {
+  if (
+    tooltipTarget &&
+    tooltipHadNativeTitle &&
+    tooltipOriginalTitle !== null &&
+    !tooltipTarget.hasAttribute('title')
+  ) {
+    tooltipTarget.setAttribute('title', tooltipOriginalTitle)
+  }
+
+  tooltipHadNativeTitle = false
+  tooltipOriginalTitle = null
+}
+
+const updateTooltipPosition = (control = tooltipTarget) => {
+  const tooltip = tooltipElement.value
+  if (!control || !tooltip) return
+
+  if (!control.isConnected) {
+    hideTooltip()
+    return
+  }
+
+  const controlRect = control.getBoundingClientRect()
+  const tooltipRect = tooltip.getBoundingClientRect()
+  if (controlRect.width === 0 && controlRect.height === 0) {
+    hideTooltip()
+    return
+  }
+
+  const viewportWidth = window.innerWidth
+  const viewportHeight = window.innerHeight
+  const preferredTop = controlRect.bottom + tooltipGap
+  const canFitBelow = preferredTop + tooltipRect.height <= viewportHeight - tooltipViewportPadding
+  const rawTop = canFitBelow
+    ? preferredTop
+    : controlRect.top - tooltipGap - tooltipRect.height
+  const maxTop = Math.max(
+    tooltipViewportPadding,
+    viewportHeight - tooltipViewportPadding - tooltipRect.height
+  )
+  const top = Math.min(
+    Math.max(rawTop, tooltipViewportPadding),
+    maxTop
+  )
+  const rawLeft = controlRect.left + (controlRect.width - tooltipRect.width) / 2
+  const maxLeft = Math.max(
+    tooltipViewportPadding,
+    viewportWidth - tooltipViewportPadding - tooltipRect.width
+  )
+  const left = Math.min(
+    Math.max(rawLeft, tooltipViewportPadding),
+    maxLeft
+  )
+
+  tooltipStyle.value = {
+    left: `${Math.round(left)}px`,
+    top: `${Math.round(top)}px`
+  }
+}
+
+const hideTooltip = () => {
+  clearTooltipShowTimer()
+  pendingTooltipTarget = null
+  restoreNativeTooltipTitle()
+  tooltipTarget = null
+  tooltipVisible.value = false
+  tooltipPositioned.value = false
+  tooltipStyle.value = {}
+}
+
+const showTooltip = async (control: HTMLElement) => {
+  const text = resolveTooltipText(control)
+  if (!text) {
+    if (tooltipTarget === control || pendingTooltipTarget === control) {
+      hideTooltip()
+    }
+    return
+  }
+
+  clearTooltipShowTimer()
+  pendingTooltipTarget = null
+
+  if (tooltipTarget === control && tooltipVisible.value) {
+    tooltipText.value = text
+    await nextTick()
+    updateTooltipPosition(control)
+    return
+  }
+
+  restoreNativeTooltipTitle()
+  tooltipTarget = control
+  tooltipText.value = text
+
+  if (control.hasAttribute('title')) {
+    tooltipOriginalTitle = control.getAttribute('title')
+    tooltipHadNativeTitle = true
+    control.removeAttribute('title')
+  }
+
+  tooltipVisible.value = true
+  tooltipPositioned.value = false
+  await nextTick()
+
+  if (tooltipTarget !== control || !tooltipVisible.value) return
+  updateTooltipPosition(control)
+  tooltipPositioned.value = true
+}
+
+const scheduleTooltip = (control: HTMLElement) => {
+  const text = resolveTooltipText(control)
+  if (!text) {
+    if (tooltipTarget === control || pendingTooltipTarget === control) {
+      hideTooltip()
+    }
+    return
+  }
+
+  clearTooltipShowTimer()
+  pendingTooltipTarget = control
+
+  if (tooltipVisible.value && tooltipTarget !== control) {
+    void showTooltip(control)
+    return
+  }
+
+  if (tooltipVisible.value && tooltipTarget === control) {
+    tooltipText.value = text
+    updateTooltipPosition(control)
+    return
+  }
+
+  tooltipShowTimer = setTimeout(() => {
+    tooltipShowTimer = null
+    if (pendingTooltipTarget === control) {
+      void showTooltip(control)
+    }
+  }, tooltipDelay)
+}
+
+const handleGlobalPointerOver = (event: PointerEvent) => {
+  if (event.pointerType === 'touch') return
+
+  const control = findTooltipControl(event)
+  if (control) scheduleTooltip(control)
+}
+
+const handleGlobalPointerOut = (event: PointerEvent) => {
+  const control = findTooltipControl(event)
+  if (!control) return
+
+  const relatedTarget = event.relatedTarget
+  if (relatedTarget instanceof Node && control.contains(relatedTarget)) return
+
+  const nextControl = findTooltipControlFromTarget(relatedTarget)
+  if (nextControl && nextControl !== control) {
+    scheduleTooltip(nextControl)
+    return
+  }
+
+  if (tooltipTarget === control || pendingTooltipTarget === control) {
+    hideTooltip()
+  }
+}
+
+const handleGlobalPointerMove = (event: PointerEvent) => {
+  if (!tooltipVisible.value) return
+
+  const control = findTooltipControl(event)
+  if (control && control === tooltipTarget) {
+    updateTooltipPosition(control)
+  }
+}
+
+const handleGlobalFocusIn = (event: FocusEvent) => {
+  const control = findTooltipControlFromTarget(event.target)
+  if (control) scheduleTooltip(control)
+}
+
+const handleGlobalFocusOut = (event: FocusEvent) => {
+  const control = findTooltipControlFromTarget(event.target)
+  if (!control) return
+
+  const relatedTarget = event.relatedTarget
+  if (relatedTarget instanceof Node && control.contains(relatedTarget)) return
+
+  if (tooltipTarget === control || pendingTooltipTarget === control) {
+    hideTooltip()
+  }
+}
+
+const handleViewportChange = () => {
+  if (tooltipVisible.value) {
+    updateTooltipPosition()
+  }
+}
+
+const handleGlobalClick = (event: MouseEvent) => {
+  const control = findTooltipControl(event)
+  if (!control) return
+
+  if (tooltipTarget === control || pendingTooltipTarget === control) {
+    hideTooltip()
+  }
 }
 
 // 全局 MD3 按钮水波纹（Ripple）动画管理器
@@ -22,8 +316,6 @@ const createRipple = (
   clientX?: number,
   clientY?: number
 ) => {
-  if (disableAnimations.value) return
-
   const rect = button.getBoundingClientRect()
   if (rect.width === 0 && rect.height === 0) return
 
@@ -108,8 +400,23 @@ onMounted(() => {
   window.addEventListener('contextmenu', handleContextMenu)
   // 使用 capture 捕获阶段监听，确保即便组件内部阻断了冒泡，也能正常触发水波纹
   window.addEventListener('pointerdown', handleGlobalPointerDown, { capture: true })
+  window.addEventListener('click', handleGlobalClick, { capture: true })
   window.addEventListener('keydown', handleGlobalKeyDown, { capture: true })
   window.addEventListener('keyup', handleGlobalKeyUp, { capture: true })
+  window.addEventListener('pointerover', handleGlobalPointerOver, { capture: true })
+  window.addEventListener('pointerout', handleGlobalPointerOut, { capture: true })
+  window.addEventListener('pointermove', handleGlobalPointerMove, {
+    capture: true,
+    passive: true
+  })
+  window.addEventListener('focusin', handleGlobalFocusIn, { capture: true })
+  window.addEventListener('focusout', handleGlobalFocusOut, { capture: true })
+  window.addEventListener('scroll', handleViewportChange, {
+    capture: true,
+    passive: true
+  })
+  window.addEventListener('resize', handleViewportChange)
+  window.addEventListener('blur', hideTooltip)
 
   statusBarRevealTimer = setTimeout(() => {
     isStatusBarVisible.value = true
@@ -121,15 +428,25 @@ onMounted(() => {
         textColor: 'var(--md-sys-color-on-primary, #042a59)'
       })
       betaNoticeTimer = null
-    }, disableAnimations.value ? 0 : 400)
+    }, 400)
   }, 1000)
 })
 
 onUnmounted(() => {
   window.removeEventListener('contextmenu', handleContextMenu)
   window.removeEventListener('pointerdown', handleGlobalPointerDown, { capture: true })
+  window.removeEventListener('click', handleGlobalClick, { capture: true })
   window.removeEventListener('keydown', handleGlobalKeyDown, { capture: true })
   window.removeEventListener('keyup', handleGlobalKeyUp, { capture: true })
+  window.removeEventListener('pointerover', handleGlobalPointerOver, { capture: true })
+  window.removeEventListener('pointerout', handleGlobalPointerOut, { capture: true })
+  window.removeEventListener('pointermove', handleGlobalPointerMove, { capture: true })
+  window.removeEventListener('focusin', handleGlobalFocusIn, { capture: true })
+  window.removeEventListener('focusout', handleGlobalFocusOut, { capture: true })
+  window.removeEventListener('scroll', handleViewportChange, { capture: true })
+  window.removeEventListener('resize', handleViewportChange)
+  window.removeEventListener('blur', hideTooltip)
+  hideTooltip()
   if (statusBarRevealTimer) {
     clearTimeout(statusBarRevealTimer)
   }
@@ -142,7 +459,6 @@ onUnmounted(() => {
 <template>
   <div
     class="app-layout"
-    :class="{ 'animations-disabled': disableAnimations }"
     @contextmenu="handleContextMenu"
   >
     <div
@@ -155,6 +471,18 @@ onUnmounted(() => {
       <WindowsManager />
       <NuxtRouteAnnouncer />
     </main>
+    <Teleport to="body">
+      <div
+        v-if="tooltipVisible"
+        ref="tooltipElement"
+        class="md3-tooltip"
+        :class="{ 'is-positioned': tooltipPositioned }"
+        :style="tooltipStyle"
+        role="tooltip"
+      >
+        {{ tooltipText }}
+      </div>
+    </Teleport>
   </div>
 </template>
 

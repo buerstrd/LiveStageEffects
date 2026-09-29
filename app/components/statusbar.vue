@@ -10,6 +10,7 @@ import {
 import { devicesManager } from '~/composables/devicesmanager'
 import { useRealtimeBpm } from '~/composables/bpmanalyzer'
 import { projectManager } from '~/composables/projectmanager'
+import { renderStatusManager } from '~/composables/renderstatusmanager'
 import { settingsManager } from '~/composables/settingsmanager'
 import { videoManager } from '~/composables/videomanager'
 import {
@@ -27,13 +28,12 @@ const {
 
 // 项目管理器
 const { currentProject } = projectManager()
-const { isOfflineMedia } = videoManager()
+const { videoSrc, isOfflineMedia } = videoManager()
 
 // 设置管理器
 const {
   showSeconds,
-  statusBarBeatIndicator,
-  disableAnimations
+  statusBarBeatIndicator
 } = settingsManager()
 const {
   bpm: realtimeBpm,
@@ -44,6 +44,10 @@ const {
   showStatusBarNotice,
   clearStatusBarNotice
 } = statusBarNoticeManager()
+const {
+  status: renderStatus,
+  progress: renderProgress
+} = renderStatusManager()
 const {
   message: bpmStatusNotice,
   noticeState: bpmStatusNoticeState,
@@ -80,8 +84,150 @@ const {
   isExpanded: isExitStatusNoticeExpanded,
   isCollapsing: isExitStatusNoticeCollapsing
 } = useStatusBarNoticeView('exit')
+const {
+  message: renderStatusNotice,
+  noticeState: renderStatusNoticeState,
+  isExpanded: isRenderStatusNoticeExpanded,
+  isCollapsing: isRenderStatusNoticeCollapsing
+} = useStatusBarNoticeView('render')
+const hasAutoShownRenderStatusNotice = useState<boolean>(
+  'render_status_auto_notice_shown',
+  () => false
+)
+const isAutoRenderStatusNoticeActive = ref(false)
 const projectButtonRef = ref<HTMLButtonElement | null>(null)
 const projectButtonNaturalWidth = ref(192)
+
+const renderRingDash = computed(() => {
+  const progress = Math.max(0, Math.min(1, renderProgress.value))
+  return `${progress} ${1 - progress}`
+})
+
+const RENDER_ETA_TICK_MS = 250
+const renderEtaVisible = ref(false)
+const renderEtaSeconds = ref<number | null>(null)
+const renderEtaDeadlineAt = ref<number | null>(null)
+const renderEtaAutoAllowed = ref(false)
+const renderEtaRequested = ref(false)
+let renderStartedAt = 0
+let renderEtaTimer: ReturnType<typeof setInterval> | null = null
+
+const clearRenderEtaTimer = () => {
+  if (renderEtaTimer) {
+    clearInterval(renderEtaTimer)
+    renderEtaTimer = null
+  }
+}
+
+const updateRenderEta = () => {
+  const now = Date.now()
+  if (!renderStartedAt) return
+
+  const elapsedSeconds = Math.max(0, (now - renderStartedAt) / 1000)
+  const progress = Math.max(0, Math.min(1, renderProgress.value))
+  if (progress > 0.01) {
+    const estimatedSeconds = Math.max(
+      0,
+      elapsedSeconds * (1 - progress) / progress
+    )
+    const estimatedDeadline = now + estimatedSeconds * 1000
+    const currentDeadline = renderEtaDeadlineAt.value
+    if (currentDeadline === null) {
+      renderEtaDeadlineAt.value = estimatedDeadline
+    } else if (renderEtaVisible.value) {
+      const remainingMs = Math.max(0, currentDeadline - now)
+      const adjustmentThreshold = Math.max(5000, remainingMs * 0.3)
+      if (
+        currentDeadline <= now ||
+        Math.abs(estimatedDeadline - currentDeadline) > adjustmentThreshold
+      ) {
+        renderEtaDeadlineAt.value = estimatedDeadline
+      }
+    } else {
+      renderEtaDeadlineAt.value = estimatedDeadline
+    }
+    if (renderEtaAutoAllowed.value || renderEtaRequested.value) {
+      renderEtaVisible.value = true
+    }
+  }
+
+  const deadline = renderEtaDeadlineAt.value
+  if (deadline !== null) {
+    renderEtaSeconds.value = Math.max(0, (deadline - now) / 1000)
+  }
+}
+
+const startRenderEtaTracking = () => {
+  clearRenderEtaTimer()
+  renderStartedAt = Date.now()
+  renderEtaVisible.value = false
+  renderEtaSeconds.value = null
+  renderEtaDeadlineAt.value = null
+  renderEtaAutoAllowed.value = false
+  renderEtaRequested.value = false
+  updateRenderEta()
+  renderEtaTimer = setInterval(updateRenderEta, RENDER_ETA_TICK_MS)
+}
+
+const stopRenderEtaTracking = () => {
+  clearRenderEtaTimer()
+  renderStartedAt = 0
+  renderEtaVisible.value = false
+  renderEtaSeconds.value = null
+  renderEtaDeadlineAt.value = null
+  renderEtaAutoAllowed.value = false
+  renderEtaRequested.value = false
+}
+
+watch(
+  renderStatus,
+  (status) => {
+    if (status === 'rendering') {
+      if (!renderEtaTimer) startRenderEtaTracking()
+      return
+    }
+    stopRenderEtaTracking()
+  },
+  { immediate: true }
+)
+
+const renderRemainingParts = computed(() => {
+  const estimatedSeconds = renderEtaSeconds.value
+  if (estimatedSeconds === null) {
+    return { value: '--', unit: '' }
+  }
+
+  const remainingSeconds = Math.max(0, Math.ceil(estimatedSeconds))
+  if (remainingSeconds < 60) {
+    return { value: String(remainingSeconds), unit: '秒' }
+  }
+  if (remainingSeconds < 3600) {
+    return {
+      value: String(Math.ceil(remainingSeconds / 60)),
+      unit: '分'
+    }
+  }
+  return {
+    value: String(Math.ceil(remainingSeconds / 3600)),
+    unit: '时'
+  }
+})
+
+const renderRemainingValueText = computed(() => {
+  const { value, unit } = renderRemainingParts.value
+  return `${value}${unit}`
+})
+
+const renderStatusDisplayText = computed(() => {
+  if (renderStatus.value === 'rendering' && renderEtaVisible.value) {
+    return `剩余 ${renderRemainingValueText.value}`
+  }
+  return renderStatusNotice.value
+})
+
+const isRenderStatusExpanded = computed(() => {
+  return isRenderStatusNoticeExpanded.value || renderEtaVisible.value
+})
 
 // 窗口管理器
 const {
@@ -172,6 +318,22 @@ const handleProjectClick = () => {
   openProjectManagerWindow()
 }
 
+const handleRenderStatusClick = () => {
+  if (renderStatus.value === 'rendering') {
+    renderEtaRequested.value = true
+    if (renderEtaDeadlineAt.value !== null) {
+      renderEtaVisible.value = true
+    }
+    showStatusBarNotice('render', '正在渲染', null)
+    return
+  }
+  if (renderStatus.value === 'completed') {
+    showStatusBarNotice('render', '渲染完成')
+    return
+  }
+  showStatusBarNotice('render', '当前未渲染')
+}
+
 const bpmButtonText = computed(() => {
   return realtimeBpm.value === null ? '' : realtimeBpm.value.toFixed(1)
 })
@@ -207,6 +369,12 @@ const bpmButtonShowsIcon = computed(() => {
     )
 })
 
+const bpmButtonIconState = computed(() => {
+  if (bpmStatus.value === 'filtering') return 'filtering'
+  if (bpmStatus.value === 'non-music') return 'non-music'
+  return 'default'
+})
+
 const STARTUP_CONNECTION_NOTICE_DURATION_MS = 5000
 const TEMPORARY_PROJECT_NOTICE_DELAY_MS = 2000
 const CONNECTION_SUCCESS_NOTICE_DURATION_MS = 2000
@@ -218,6 +386,41 @@ const OFFLINE_MEDIA_NOTICE_BACKGROUND = '#ffb300'
 const OFFLINE_MEDIA_NOTICE_TEXT_COLOR = '#2b1b00'
 const DISCONNECT_WARNING_BACKGROUND = 'rgba(198, 40, 40, 0.45)'
 const DISCONNECT_WARNING_TEXT_COLOR = '#ffffff'
+
+watch(
+  renderStatus,
+  (status, previousStatus) => {
+    const isNoticeOpen = Boolean(renderStatusNotice.value)
+
+    if (status === 'rendering') {
+      renderEtaAutoAllowed.value = !hasAutoShownRenderStatusNotice.value
+      if (renderEtaAutoAllowed.value) {
+        hasAutoShownRenderStatusNotice.value = true
+        isAutoRenderStatusNoticeActive.value = true
+        showStatusBarNotice('render', '正在渲染', null)
+        return
+      }
+      if (isNoticeOpen) {
+        clearStatusBarNotice('render')
+      }
+      return
+    }
+    if (status === 'completed') {
+      if (isAutoRenderStatusNoticeActive.value || isNoticeOpen) {
+        showStatusBarNotice('render', '渲染完成')
+      }
+      isAutoRenderStatusNoticeActive.value = false
+      return
+    }
+    if (previousStatus !== 'idle') {
+      isAutoRenderStatusNoticeActive.value = false
+      if (isNoticeOpen) {
+        clearStatusBarNotice('render')
+      }
+    }
+  },
+  { immediate: true }
+)
 
 const getStatusBarNoticeStyle = (notice: StatusBarNoticeState | null) => {
   if (!notice) return undefined
@@ -272,13 +475,23 @@ const getBpmStatusNotice = (status: string) => {
   }
 }
 
+const shownBpmStatusNotices = new Set<string>()
+
+const resetBpmNoticeHistory = () => {
+  shownBpmStatusNotices.clear()
+}
+
 const showBpmStatusNotice = (status: string) => {
   const notice = getBpmStatusNotice(status)
-  if (!notice) return
+  if (!notice || shownBpmStatusNotices.has(status)) return
+  shownBpmStatusNotices.add(status)
   showStatusBarNotice('bpm', notice)
 }
 
 watch(() => bpmStatus.value, showBpmStatusNotice)
+watch(() => videoSrc.value, () => {
+  resetBpmNoticeHistory()
+})
 
 let startupConnectionNoticeShown = false
 let connectionNoticeTimer: ReturnType<typeof setTimeout> | null = null
@@ -339,7 +552,7 @@ watch(
         '设备已连接',
         CONNECTION_SUCCESS_NOTICE_DURATION_MS
       )
-    }, disableAnimations.value ? 0 : CONNECTION_NOTICE_DELAY_MS)
+    }, CONNECTION_NOTICE_DELAY_MS)
   }
 )
 
@@ -419,6 +632,7 @@ onUnmounted(() => {
   if (exitConfirmationTimer) {
     clearTimeout(exitConfirmationTimer)
   }
+  clearRenderEtaTimer()
 })
 </script>
 
@@ -428,7 +642,7 @@ onUnmounted(() => {
     :class="{ 'connected-blue': hasConnectedDevice }"
   >
     <span
-      v-if="statusBarBeatIndicator && realtimeBpm !== null && !disableAnimations"
+      v-if="statusBarBeatIndicator && realtimeBpm !== null"
       :key="beatPulse"
       class="status-bar-beat-flash"
       aria-hidden="true"
@@ -608,7 +822,7 @@ onUnmounted(() => {
       >
         <svg class="icon" viewBox="0 -960 960 960" fill="currentColor">
           <path
-            d="M160-160q-33 0-56.5-23.5T80-240v-480q0-33 23.5-56.5T160-800h640q33 0 56.5 23.5T880-720v480q0 33-23.5 56.5T880-160H160Zm0-80h640v-480H160v480Zm0 0v-480 480Zm120-80h240v-80H280v80Zm-36-156 116-116-116-116 56-56 172 172-172 172-56-56Z"
+            d="M260-120q-58 0-99-41t-41-99q0-58 41-99t99-41h60v-160h-60q-58 0-99-41t-41-99q0-58 41-99t99-41q58 0 99 41t41 99v60h160v-60q0-58 41-99t99-41q58 0 99 41t41 99q0 58-41 99t-99 41h-60v160h60q58 0 99 41t41 99q0 58-41 99t-99 41q-58 0-99-41t-41-99v-60H400v60q0 58-41 99t-99 41Zm0-80q25 0 42.5-17.5T320-260v-60h-60q-25 0-42.5 17.5T200-260q0 25 17.5 42.5T260-200Zm440 0q25 0 42.5-17.5T760-260q0-25-17.5-42.5T700-320h-60v60q0 25 17.5 42.5T700-200ZM400-400h160v-160H400v160ZM260-640h60v-60q0-25-17.5-42.5T260-760q-25 0-42.5 17.5T200-700q0 25 17.5 42.5T260-640Zm380 0h60q25 0 42.5-17.5T760-700q0-25-17.5-42.5T700-760q-25 0-42.5 17.5T640-700v60Z"
           />
         </svg>
       </button>
@@ -651,6 +865,83 @@ onUnmounted(() => {
         </svg>
       </button>
 
+      <!-- 渲染状态 -->
+      <button
+        class="md3-icon-button render-status-button"
+        :class="{
+          'is-rendering': renderStatus === 'rendering',
+          'is-render-completed': renderStatus === 'completed',
+          'is-status-notice': isRenderStatusExpanded,
+          'is-status-notice-collapsing': isRenderStatusNoticeCollapsing,
+          'has-notice-background': Boolean(renderStatusNoticeState?.backgroundColor),
+          'is-notice-flash': Boolean(renderStatusNoticeState?.flash)
+        }"
+        :style="getStatusBarNoticeStyle(renderStatusNoticeState)"
+        type="button"
+        :aria-label="
+          renderStatusDisplayText
+            ? `渲染状态，${renderStatusDisplayText}`
+            : renderStatus === 'rendering'
+              ? '渲染状态，正在渲染'
+              : renderStatus === 'completed'
+                ? '渲染状态，渲染完成'
+                : '渲染状态，当前未渲染'
+        "
+        :disabled="isInitialProjectManagerOpen"
+        @click="handleRenderStatusClick"
+      >
+        <span
+          class="render-status-content"
+          :class="{ 'has-notice': Boolean(renderStatusDisplayText) }"
+        >
+          <span
+            class="render-status-icon"
+            :class="`is-${renderStatus}`"
+            aria-hidden="true"
+          >
+            <svg viewBox="0 0 24 24">
+              <circle
+                class="render-ring-track"
+                cx="12"
+                cy="12"
+                r="8"
+              />
+              <circle
+                v-if="renderProgress > 0"
+                class="render-ring-progress"
+                cx="12"
+                cy="12"
+                r="8"
+                pathLength="1"
+                :stroke-dasharray="renderRingDash"
+              />
+              <path
+                class="render-complete-check"
+                d="M9.2 16.2 5 12l-1.4 1.4L9.2 19 21 7.2 19.6 5.8 9.2 16.2Z"
+              />
+            </svg>
+          </span>
+          <span
+            v-if="renderStatus === 'rendering' && renderEtaVisible"
+            class="render-status-eta"
+          >
+            <span class="render-status-eta-label">剩余</span>
+            <span class="render-status-eta-value">
+              {{ renderRemainingValueText }}
+            </span>
+          </span>
+          <Transition v-else name="render-status-text" mode="out-in">
+            <span
+              v-if="renderStatusNotice"
+              :key="renderStatusNotice"
+              class="render-status-text"
+            >
+              {{ renderStatusNotice }}
+            </span>
+          </Transition>
+        </span>
+      </button>
+
       <!-- BPM 指示器 -->
       <button
         class="md3-icon-button md3-bpm-button"
@@ -678,7 +969,6 @@ onUnmounted(() => {
           v-if="
             !statusBarBeatIndicator
             && realtimeBpm !== null
-            && !disableAnimations
           "
           :key="beatPulse"
           class="bpm-beat-flash"
@@ -705,13 +995,27 @@ onUnmounted(() => {
         >
           <svg
             v-if="bpmButtonShowsIcon"
-            key="icon"
+            :key="bpmButtonIconState"
             class="bpm-button-icon"
+            :class="{
+              'is-filtering': bpmButtonIconState === 'filtering'
+            }"
             viewBox="0 0 24 24"
             fill="currentColor"
             aria-hidden="true"
           >
-            <path d="M7 18h2V6H7v12zm4 4h2V2h-2v20zm-8-8h2v-4H3v4zm12 4h2V6h-2v12zm4-8v4h2v-4h-2z" />
+            <path
+              v-if="bpmButtonIconState === 'non-music'"
+              d="M18.3 5.71 12 12.01l-6.3-6.3-1.41 1.41 6.3 6.3-6.3 6.3 1.41 1.41 6.3-6.3 6.3 6.3 1.41-1.41-6.3-6.3 6.3-6.3-1.41-1.41Z"
+            />
+            <path
+              v-else-if="bpmButtonIconState === 'filtering'"
+              d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"
+            />
+            <path
+              v-else
+              d="M7 18h2V6H7v12zm4 4h2V2h-2v20zm-8-8h2v-4H3v4zm12 4h2V6h-2v12zm4-8v4h2v-4h-2z"
+            />
           </svg>
           <span
             v-else
@@ -773,6 +1077,7 @@ onUnmounted(() => {
 .status-bar {
   --status-bar-notice-default-background: var(--md-sys-color-primary, #8ab4f8);
   --status-bar-notice-default-text-color: var(--md-sys-color-on-primary, #042a59);
+  --status-bar-button-default-color: var(--md-sys-color-on-surface-variant, #aab3bf);
   position: relative;
   height: 48px;
   width: 100%;
@@ -811,6 +1116,7 @@ onUnmounted(() => {
 
 .status-bar.connected-blue {
   --md-sys-color-on-surface: #ffffff;
+  --status-bar-button-default-color: #ffffff;
   background-color: rgb(96, 147, 185); /* r0.375 g0.576 b0.725 (#6093b9) */
   border-bottom: 1px solid rgba(255, 255, 255, 0.25);
   box-shadow: 0 2px 14px rgba(96, 147, 185, 0.4);
@@ -977,17 +1283,148 @@ onUnmounted(() => {
     flex-basis: 124px;
     width: 124px;
     min-width: 124px;
+    background-color: var(
+      --status-bar-notice-background,
+      var(--status-bar-notice-default-background)
+    );
+    color: var(
+      --status-bar-notice-text-color,
+      var(--status-bar-notice-default-text-color)
+    );
   }
 
   to {
     flex-basis: var(--status-bar-notice-collapsed-width);
     width: var(--status-bar-notice-collapsed-width);
     min-width: var(--status-bar-notice-collapsed-width);
+    background-color: transparent;
+    color: var(--status-bar-button-default-color);
   }
 }
 
 .md3-icon-button.is-notice-flash {
   animation: status-bar-notice-warning-flash 0.42s ease-in-out 3;
+}
+
+.render-status-content {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: inherit;
+}
+
+.render-status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+}
+
+.render-status-icon svg {
+  display: block;
+  width: 24px;
+  height: 24px;
+  transform-origin: center;
+}
+
+.render-ring-track,
+.render-ring-progress,
+.render-complete-check {
+  display: none;
+}
+
+.render-ring-track,
+.render-ring-progress {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+
+.render-ring-track {
+  opacity: 0.24;
+}
+
+.render-ring-progress {
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: center;
+  transition: stroke-dasharray 0.12s linear;
+}
+
+.render-status-icon.is-idle .render-ring-track,
+.render-status-icon.is-rendering .render-ring-track,
+.render-status-icon.is-rendering .render-ring-progress {
+  display: block;
+}
+
+.render-status-icon.is-completed .render-complete-check {
+  display: block;
+  fill: currentColor;
+  transform-origin: center;
+  animation: render-status-check 0.34s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.render-status-text {
+  display: inline-block;
+  color: inherit;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.render-status-eta {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 4px;
+  color: inherit;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.render-status-eta-label {
+  flex: 0 0 auto;
+}
+
+.render-status-eta-value {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.render-status-text-enter-active,
+.render-status-text-leave-active {
+  transition: opacity 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.render-status-text-enter-from {
+  opacity: 0;
+}
+
+.render-status-text-leave-to {
+  opacity: 0;
+}
+
+@keyframes render-status-check {
+  from {
+    opacity: 0;
+    transform: scale(0.55);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 @keyframes status-bar-notice-warning-flash {
@@ -1016,7 +1453,7 @@ onUnmounted(() => {
 
 .bpm-button-content-enter-active,
 .bpm-button-content-leave-active {
-  transition: opacity 0.12s cubic-bezier(0.2, 0, 0, 1);
+  transition: opacity 0.2s cubic-bezier(0.2, 0, 0, 1);
 }
 
 .bpm-button-content-enter-from,
@@ -1052,6 +1489,21 @@ onUnmounted(() => {
   width: 22px;
   height: 22px;
   display: block;
+}
+
+.bpm-button-icon.is-filtering {
+  animation: bpm-status-breathe 1.25s ease-in-out infinite;
+}
+
+@keyframes bpm-status-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+
+  50% {
+    opacity: 1;
+  }
 }
 
 .bpm-beat-flash {

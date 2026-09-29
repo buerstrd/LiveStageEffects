@@ -2,7 +2,7 @@
 import { computed, ref, nextTick, watch, onMounted, onUnmounted } from 'vue'
 import {
   eventsManager,
-  formatTriggerTime,
+  formatTimelineTime,
   getEventEndTimeSeconds,
   getEventPresetPlaybacks,
   getEventPresetPlaybacksAtTime,
@@ -12,11 +12,11 @@ import {
   type EventItem,
   type EventMovePosition
 } from '~/composables/eventsmanager'
-import { applyGamma, sampleCurveBrightness, sampleCurveColor } from '~/composables/devicesmanager'
+import { applyGamma, sampleEffectAtProgress } from '~/composables/devicesmanager'
 import { outputsettingsManager } from '~/composables/outputsettingsmanager'
-import { presetsManager, type PresetItem, type PresetLightEffect } from '~/composables/presetsmanager'
 import { videoManager } from '~/composables/videomanager'
 import { windowsManager } from '~/composables/windowsmanager'
+import type { PresetItem, PresetLightEffect } from '~/utils/presetcurve'
 
 const {
   events,
@@ -37,30 +37,41 @@ const {
   duration,
   seekVideo
 } = videoManager()
-const { focusWindow, setDesignViewMode } = windowsManager()
+const { focusWindow } = windowsManager()
 
-const TIME_INPUT_DIGITS = 8
+const TIME_INPUT_DIGITS = 6
 const editingTimeId = ref<number | null>(null)
 const editingEndTimeId = ref<number | null>(null)
+const timeInputDraft = ref('')
+const endTimeInputDraft = ref('')
+const EVENT_TIME_STEP_SECONDS = 1
+const EVENT_TIME_MIN_RANGE_SECONDS = 1
+const EVENT_TIME_ADJUST_REPEAT_MS = 100
+const EVENT_VIDEO_DURATION_EPSILON_SECONDS = 0.01
+
+type EventTimeAdjustSide = 'start' | 'end'
+type EventTimeAdjustDirection = 'left' | 'right'
+
+const eventTimeAdjustmentKey = ref<string | null>(null)
+let eventTimeAdjustTimer: ReturnType<typeof setInterval> | null = null
+let eventTimeAdjustPointerId: number | null = null
+let eventTimeAdjustElement: HTMLElement | null = null
+
+const getEventTimeAdjustmentKey = (
+  eventId: number,
+  side: EventTimeAdjustSide,
+  direction: EventTimeAdjustDirection
+) => `${eventId}-${side}-${direction}`
+
+const pendingDeleteEventId = ref<number | null>(null)
+let eventDeleteConfirmTimer: ReturnType<typeof setTimeout> | null = null
 const eventDeselectArmed = ref(false)
-type TimeInputDragTarget = 'start' | 'end'
-interface TimeInputDragState {
-  pointerId: number
-  inputEl: HTMLInputElement
-  target: TimeInputDragTarget
-  eventId: number
-  startClientX: number
-  initialSeconds: number
-  moved: boolean
-}
-let timeInputDrag: TimeInputDragState | null = null
-let suppressTimeInputClick = false
-const isTimeInputInteracting = ref(false)
 const timelinePreview = ref<{
   eventId: number
   event: EventItem
   preset: PresetItem
   progress: number
+  repeat: number
 } | null>(null)
 const eventProgressRefs = new Map<number, HTMLDivElement>()
 const eventProgressHideTimers = new Map<HTMLDivElement, ReturnType<typeof setTimeout>>()
@@ -81,13 +92,11 @@ const formatTimeDigits = (seconds: number) => {
   const hours = Math.floor(totalHundredths / 360000)
   const minutes = Math.floor((totalHundredths % 360000) / 6000)
   const wholeSeconds = Math.floor((totalHundredths % 6000) / 100)
-  const hundredths = totalHundredths % 100
 
   return [
     String(hours).padStart(2, '0'),
     String(minutes).padStart(2, '0'),
-    String(wholeSeconds).padStart(2, '0'),
-    String(hundredths).padStart(2, '0')
+    String(wholeSeconds).padStart(2, '0')
   ].join('')
 }
 
@@ -98,7 +107,6 @@ const formatTimeInputDigits = (digits: string) => {
   let formatted = raw.slice(0, 2)
   if (raw.length > 2) formatted += `:${raw.slice(2, 4)}`
   if (raw.length > 4) formatted += `:${raw.slice(4, 6)}`
-  if (raw.length > 6) formatted += `.${raw.slice(6, 8)}`
   return formatted
 }
 
@@ -120,141 +128,45 @@ const parseTimeDigits = (digits: string) => {
   const hours = Number(padded.slice(0, 2))
   const minutes = Number(padded.slice(2, 4))
   const seconds = Number(padded.slice(4, 6))
-  const hundredths = Number(padded.slice(6, 8))
 
   if (minutes > 59 || seconds > 59) return null
-  return hours * 3600 + minutes * 60 + seconds + hundredths / 100
+  return hours * 3600 + minutes * 60 + seconds
 }
 
-const normalizeDraggedTime = (seconds: number) => {
-  return Math.round(Math.max(0, seconds) * 100) / 100
-}
+const eventStartExceedsVideoDuration = (eventItem: EventItem) => {
+  const videoTotalSeconds = duration.value
+  if (
+    !Number.isFinite(videoTotalSeconds) ||
+    videoTotalSeconds <= 0
+  ) {
+    return false
+  }
 
-const startTimeInputDrag = (
-  eventId: number,
-  target: TimeInputDragTarget,
-  pointerEvent: PointerEvent
-) => {
-  if (pointerEvent.button !== 0) return
-
-  const eventItem = events.value.find(event => event.id === eventId)
-  if (!eventItem) return
-
-  const inputEl = pointerEvent.currentTarget as HTMLInputElement
-  const startTime = isValidTriggerTime(eventItem.time)
+  const startTimeSeconds = isValidTriggerTime(eventItem.time)
     ? parseTimeToSeconds(eventItem.time)
-    : 0
-  const initialSeconds = target === 'start'
-    ? startTime
-    : getEventEndTimeSeconds(eventItem) ?? startTime + 0.01
-
-  timeInputDrag = {
-    pointerId: pointerEvent.pointerId,
-    inputEl,
-    target,
-    eventId,
-    startClientX: pointerEvent.clientX,
-    initialSeconds,
-    moved: false
-  }
-  isTimeInputInteracting.value = true
-}
-
-const cancelTimeInputDrag = () => {
-  timeInputDrag = null
-  suppressTimeInputClick = false
-  isTimeInputInteracting.value = false
-}
-
-const handleTimeInputDragMove = (pointerEvent: PointerEvent) => {
-  const drag = timeInputDrag
-  if (!drag || pointerEvent.pointerId !== drag.pointerId) return
-  if ((pointerEvent.buttons & 1) === 0) {
-    cancelTimeInputDrag()
-    return
-  }
-
-  const deltaX = pointerEvent.clientX - drag.startClientX
-  if (!drag.moved && Math.abs(deltaX) < 3) return
-
-  if (!drag.moved) {
-    drag.inputEl.blur()
-    suppressTimeInputClick = true
-  }
-  drag.moved = true
-  pointerEvent.preventDefault()
-
-  const eventItem = events.value.find(event => event.id === drag.eventId)
-  if (!eventItem) return
-
-  const nextSeconds = normalizeDraggedTime(
-    drag.initialSeconds + deltaX * 0.02
+    : null
+  return (
+    startTimeSeconds !== null &&
+    startTimeSeconds > videoTotalSeconds + EVENT_VIDEO_DURATION_EPSILON_SECONDS
   )
-  const startTime = isValidTriggerTime(eventItem.time)
-    ? parseTimeToSeconds(eventItem.time)
-    : 0
-
-  if (drag.target === 'start') {
-    const endTime = getEventEndTimeSeconds(eventItem)
-    const clampedSeconds = endTime === null
-      ? nextSeconds
-      : Math.min(nextSeconds, Math.max(0, endTime - 0.01))
-    updateEventTime(drag.eventId, formatTriggerTime(clampedSeconds))
-    if (videoSrc.value && duration.value > 0) {
-      seekVideo(clampedSeconds, true)
-    }
-    return
-  }
-
-  const endSeconds = Math.max(startTime + 0.01, nextSeconds)
-  updateEventEndTime(drag.eventId, formatTriggerTime(endSeconds))
-  if (videoSrc.value && duration.value > 0) {
-    seekVideo(endSeconds, true)
-  }
 }
 
-const handleTimeInputDragEnd = (pointerEvent: PointerEvent) => {
-  const drag = timeInputDrag
-  if (!drag || pointerEvent.pointerId !== drag.pointerId) return
-
-  timeInputDrag = null
-  isTimeInputInteracting.value = false
-
-  if (!drag.moved) {
-    drag.inputEl.focus()
-    drag.inputEl.select()
-    return
+const eventEndExceedsVideoDuration = (eventItem: EventItem) => {
+  const videoTotalSeconds = duration.value
+  if (
+    !Number.isFinite(videoTotalSeconds) ||
+    videoTotalSeconds <= 0
+  ) {
+    return false
   }
-
-  const eventItem = events.value.find(event => event.id === drag.eventId)
-  if (eventItem && videoSrc.value && duration.value > 0) {
-    const finalSeconds = drag.target === 'start'
-      ? (
-          isValidTriggerTime(eventItem.time)
-            ? parseTimeToSeconds(eventItem.time)
-            : null
-        )
-      : getEventEndTimeSeconds(eventItem)
-
-    if (finalSeconds !== null) {
-      seekVideo(finalSeconds)
-    }
-  }
-
-  suppressTimeInputClick = true
-  setTimeout(() => {
-    suppressTimeInputClick = false
-  }, 0)
+  const endTimeSeconds = getEventEndTimeSeconds(eventItem)
+  return (
+    endTimeSeconds !== null &&
+    endTimeSeconds > videoTotalSeconds + EVENT_VIDEO_DURATION_EPSILON_SECONDS
+  )
 }
 
-const handleTimeInputClick = (event: MouseEvent) => {
-  if (!suppressTimeInputClick) return
-  event.preventDefault()
-  event.stopPropagation()
-  suppressTimeInputClick = false
-}
-
-const handleTimeInput = (e: Event) => {
+const handleTimeInput = (e: Event, target: 'start' | 'end') => {
   const inputEl = e.target as HTMLInputElement
   const caret = inputEl.selectionStart ?? inputEl.value.length
   const digitsBeforeCaret = inputEl.value
@@ -265,11 +177,19 @@ const handleTimeInput = (e: Event) => {
   const formatted = formatTimeInputDigits(digits)
 
   inputEl.value = formatted
+  if (target === 'start') {
+    timeInputDraft.value = formatted
+  } else {
+    endTimeInputDraft.value = formatted
+  }
   const nextCaret = getTimeInputCaretPosition(formatted, digitsBeforeCaret)
   inputEl.setSelectionRange(nextCaret, nextCaret)
 }
 
-const handleTimeKeydown = (e: KeyboardEvent) => {
+const handleTimeKeydown = (
+  e: KeyboardEvent,
+  target: 'start' | 'end'
+) => {
   const inputEl = e.target as HTMLInputElement
 
   if (e.key === 'Enter') {
@@ -294,7 +214,7 @@ const handleTimeKeydown = (e: KeyboardEvent) => {
     ? selectionStart - 1
     : selectionStart
   const separator = inputEl.value[separatorIndex]
-  if (separator !== ':' && separator !== '.') return
+  if (separator !== ':') return
 
   const adjacentDigitIndex = isBackspace
     ? separatorIndex - 1
@@ -311,6 +231,11 @@ const handleTimeKeydown = (e: KeyboardEvent) => {
   const formatted = formatTimeInputDigits(nextDigits)
 
   inputEl.value = formatted
+  if (target === 'start') {
+    timeInputDraft.value = formatted
+  } else {
+    endTimeInputDraft.value = formatted
+  }
   const nextCaret = getTimeInputCaretPosition(formatted, digitIndex)
   inputEl.setSelectionRange(nextCaret, nextCaret)
 }
@@ -318,9 +243,11 @@ const handleTimeKeydown = (e: KeyboardEvent) => {
 const handleTimeFocus = (id: number, time: string | undefined, e: FocusEvent) => {
   editingTimeId.value = id
   const inputEl = e.target as HTMLInputElement
-  inputEl.value = isValidTriggerTime(time)
+  const formatted = isValidTriggerTime(time)
     ? formatTimeInputDigits(formatTimeDigits(parseTimeToSeconds(time)))
     : ''
+  timeInputDraft.value = formatted
+  inputEl.value = formatted
   inputEl.select()
 }
 
@@ -331,6 +258,7 @@ const handleTimeBlur = (id: number, e: FocusEvent) => {
 
   if (!digits) {
     inputEl.value = ''
+    timeInputDraft.value = ''
     updateEventTime(id, '')
     return
   }
@@ -338,29 +266,33 @@ const handleTimeBlur = (id: number, e: FocusEvent) => {
   const seconds = parseTimeDigits(digits)
   if (seconds === null) {
     inputEl.value = ''
+    timeInputDraft.value = ''
     updateEventTime(id, '')
     return
   }
 
-  inputEl.value = formatTriggerTime(seconds, true)
-  updateEventTime(id, formatTriggerTime(seconds))
+  const formatted = formatTimelineTime(seconds, true)
+  timeInputDraft.value = formatted
+  inputEl.value = formatted
+  updateEventTime(id, formatTimelineTime(seconds))
 }
 
 const getEventTimeInputValue = (id: number, time: string | undefined) => {
   if (!isValidTriggerTime(time)) return ''
+  if (editingTimeId.value === id) return timeInputDraft.value
   const seconds = parseTimeToSeconds(time)
-  return editingTimeId.value === id
-    ? formatTimeInputDigits(formatTimeDigits(seconds))
-    : formatTriggerTime(seconds, true)
+  return formatTimelineTime(seconds, true)
 }
 
 const handleEndTimeFocus = (event: EventItem, e: FocusEvent) => {
   editingEndTimeId.value = event.id
   const inputEl = e.target as HTMLInputElement
   const endTime = getEventEndTimeSeconds(event)
-  inputEl.value = endTime === null
+  const formatted = endTime === null
     ? ''
     : formatTimeInputDigits(formatTimeDigits(endTime))
+  endTimeInputDraft.value = formatted
+  inputEl.value = formatted
   inputEl.select()
 }
 
@@ -372,7 +304,11 @@ const handleEndTimeBlur = (event: EventItem, e: FocusEvent) => {
   if (!digits) {
     updateEventEndTime(event.id, '')
     const fallbackEndTime = getEventEndTimeSeconds(event)
-    inputEl.value = fallbackEndTime === null ? '' : formatTriggerTime(fallbackEndTime, true)
+    const formatted = fallbackEndTime === null
+      ? ''
+      : formatTimelineTime(fallbackEndTime, true)
+    endTimeInputDraft.value = formatted
+    inputEl.value = formatted
     return
   }
 
@@ -380,21 +316,135 @@ const handleEndTimeBlur = (event: EventItem, e: FocusEvent) => {
   const startTime = isValidTriggerTime(event.time) ? parseTimeToSeconds(event.time) : null
   if (seconds === null || startTime === null || seconds <= startTime) {
     const currentEndTime = getEventEndTimeSeconds(event)
-    inputEl.value = currentEndTime === null ? '' : formatTriggerTime(currentEndTime, true)
+    const formatted = currentEndTime === null
+      ? ''
+      : formatTimelineTime(currentEndTime, true)
+    endTimeInputDraft.value = formatted
+    inputEl.value = formatted
     return
   }
 
-  const formattedEndTime = formatTriggerTime(seconds)
-  inputEl.value = formatTriggerTime(seconds, true)
+  const formattedEndTime = formatTimelineTime(seconds)
+  const formattedInput = formatTimelineTime(seconds, true)
+  endTimeInputDraft.value = formattedInput
+  inputEl.value = formattedInput
   updateEventEndTime(event.id, formattedEndTime)
 }
 
 const getEventEndTimeInputValue = (event: EventItem) => {
+  if (editingEndTimeId.value === event.id) return endTimeInputDraft.value
   const endTime = getEventEndTimeSeconds(event)
   if (endTime === null) return ''
-  return editingEndTimeId.value === event.id
-    ? formatTimeInputDigits(formatTimeDigits(endTime))
-    : formatTriggerTime(endTime, true)
+  return formatTimelineTime(endTime, true)
+}
+
+const stopEventTimeAdjustment = () => {
+  if (eventTimeAdjustTimer !== null) {
+    clearInterval(eventTimeAdjustTimer)
+    eventTimeAdjustTimer = null
+  }
+
+  const element = eventTimeAdjustElement
+  const pointerId = eventTimeAdjustPointerId
+  if (
+    element &&
+    pointerId !== null &&
+    element.hasPointerCapture(pointerId)
+  ) {
+    try {
+      element.releasePointerCapture(pointerId)
+    } catch {}
+  }
+
+  eventTimeAdjustElement = null
+  eventTimeAdjustPointerId = null
+  eventTimeAdjustmentKey.value = null
+}
+
+const stepEventTime = (
+  eventId: number,
+  side: EventTimeAdjustSide,
+  direction: EventTimeAdjustDirection
+) => {
+  const eventItem = events.value.find(event => event.id === eventId)
+  if (!eventItem || !isValidTriggerTime(eventItem.time)) {
+    stopEventTimeAdjustment()
+    return
+  }
+
+  const startTime = parseTimeToSeconds(eventItem.time)
+  const endTime = getEventEndTimeSeconds(eventItem)
+  const delta = direction === 'left'
+    ? -EVENT_TIME_STEP_SECONDS
+    : EVENT_TIME_STEP_SECONDS
+
+  if (side === 'start') {
+    const maxStart = endTime === null
+      ? Number.POSITIVE_INFINITY
+      : endTime - EVENT_TIME_MIN_RANGE_SECONDS
+    const nextStart = Math.max(
+      0,
+      Math.min(maxStart, startTime + delta)
+    )
+    if (nextStart === startTime) return
+    updateEventTime(eventId, formatTimelineTime(nextStart))
+    return
+  }
+
+  if (endTime === null && direction === 'left') return
+
+  const currentEnd = endTime ?? startTime
+  const nextEnd = Math.max(
+    startTime + EVENT_TIME_MIN_RANGE_SECONDS,
+    currentEnd + delta
+  )
+  if (nextEnd === currentEnd) return
+  updateEventEndTime(eventId, formatTimelineTime(nextEnd))
+}
+
+const startEventTimeAdjustment = (
+  eventId: number,
+  side: EventTimeAdjustSide,
+  direction: EventTimeAdjustDirection,
+  event: PointerEvent
+) => {
+  if (event.button !== 0 || eventTimeAdjustPointerId !== null) return
+  const eventItem = events.value.find(item => item.id === eventId)
+  if (!eventItem || !isValidTriggerTime(eventItem.time)) return
+
+  event.preventDefault()
+  event.stopPropagation()
+
+  const element = event.currentTarget instanceof HTMLElement
+    ? event.currentTarget
+    : null
+  if (element) {
+    try {
+      element.setPointerCapture(event.pointerId)
+    } catch {}
+  }
+
+  eventTimeAdjustmentKey.value = getEventTimeAdjustmentKey(
+    eventId,
+    side,
+    direction
+  )
+  eventTimeAdjustPointerId = event.pointerId
+  eventTimeAdjustElement = element
+  stepEventTime(eventId, side, direction)
+  eventTimeAdjustTimer = setInterval(() => {
+    stepEventTime(eventId, side, direction)
+  }, EVENT_TIME_ADJUST_REPEAT_MS)
+}
+
+const handleEventTimeAdjustmentClick = (
+  eventId: number,
+  side: EventTimeAdjustSide,
+  direction: EventTimeAdjustDirection,
+  event: MouseEvent
+) => {
+  if (event.detail !== 0) return
+  stepEventTime(eventId, side, direction)
 }
 
 const editingId = ref<number | null>(null)
@@ -518,7 +568,7 @@ const getEventEffectContext = (preset: PresetItem) => {
   if (!effect) return null
 
   const effectRepeat = typeof effect.repeat === 'number' ? effect.repeat : 1
-  const totalRepeat = effectRepeat === 0 ? 1 : Math.max(1, effectRepeat)
+  const totalRepeat = effectRepeat === 0 ? 0 : Math.max(1, effectRepeat)
   const { globalBrightness } = outputsettingsManager()
   const dimmer = Math.max(0, Math.min(100, globalBrightness.value)) / 100
   const masterDimmer = applyGamma(dimmer)
@@ -539,20 +589,30 @@ const sampleEventEffect = (
   const clampedProgress = Math.max(0, Math.min(1, progress))
   const cycleProgress = clampedProgress >= 1
     ? 1
-    : (clampedProgress * totalRepeat) % 1
-  const color = sampleCurveColor(effect.colorPoints, cycleProgress, effect.color)
-  const brightness = sampleCurveBrightness(effect.points, cycleProgress)
+    : totalRepeat === 0
+      ? clampedProgress
+      : (clampedProgress * totalRepeat) % 1
+  const sampled = sampleEffectAtProgress(effect.points, cycleProgress, effect.color)
 
   return {
-    color,
-    brightness: Math.max(0, Math.min(1, brightness * masterDimmer))
+    color: sampled.color,
+    brightness: Math.max(0, Math.min(1, sampled.brightness * masterDimmer))
   }
 }
 
-const getEventEffectState = (preset: PresetItem, progress: number) => {
+const getEventEffectState = (
+  preset: PresetItem,
+  progress: number,
+  repeatOverride?: number
+) => {
   const context = getEventEffectContext(preset)
   return context
-    ? sampleEventEffect(context.effect, context.totalRepeat, context.masterDimmer, progress)
+    ? sampleEventEffect(
+        context.effect,
+        repeatOverride ?? context.totalRepeat,
+        context.masterDimmer,
+        progress
+      )
     : null
 }
 
@@ -575,6 +635,7 @@ const updateTimelinePreview = (time: number) => {
         eventId: activeEntry.event.id,
         event: activeEntry.event,
         preset: activeEntry.playback.preset,
+        repeat: activeEntry.playback.visualRepeat,
         progress: Math.max(
           0,
           Math.min(
@@ -596,7 +657,8 @@ watch(
 const getEventProgressVisual = (
   eventId: number,
   preset: PresetItem | null,
-  progress: number
+  progress: number,
+  repeatOverride?: number
 ) => {
   if (!preset) {
     return lastEventProgressVisuals.get(eventId) ?? {
@@ -606,7 +668,7 @@ const getEventProgressVisual = (
   }
 
   const clampedProgress = Math.max(0, Math.min(1, progress))
-  const state = getEventEffectState(preset, clampedProgress)
+  const state = getEventEffectState(preset, clampedProgress, repeatOverride)
 
   if (!state) {
     const fallbackVisual = {
@@ -675,7 +737,8 @@ const getEventProgressRenderState = () => {
   const createRenderState = (
     event: EventItem,
     preset: PresetItem | null,
-    visualProgress: number
+    visualProgress: number,
+    visualRepeat?: number
   ) => {
     const progress = getEventTimeProgress(event)
     if (progress >= 1) return null
@@ -683,13 +746,13 @@ const getEventProgressRenderState = () => {
     return {
       event,
       progress,
-      visual: getEventProgressVisual(event.id, preset, visualProgress)
+      visual: getEventProgressVisual(event.id, preset, visualProgress, visualRepeat)
     }
   }
 
   const preview = timelinePreview.value
   if (preview) {
-    return createRenderState(preview.event, preview.preset, preview.progress)
+    return createRenderState(preview.event, preview.preset, preview.progress, preview.repeat)
   }
 
   const activeEventId = playingEventId.value
@@ -704,7 +767,8 @@ const getEventProgressRenderState = () => {
       return createRenderState(
         activeEvent,
         activePlayback?.preset ?? null,
-        eventPlayProgress.value
+        eventPlayProgress.value,
+        activePlayback?.visualRepeat
       )
     }
   }
@@ -807,18 +871,16 @@ watch(
 )
 
 onMounted(() => {
-  window.addEventListener('pointermove', handleTimeInputDragMove, true)
-  window.addEventListener('pointerup', handleTimeInputDragEnd, true)
-  window.addEventListener('pointercancel', handleTimeInputDragEnd, true)
-  window.addEventListener('blur', cancelTimeInputDrag)
+  window.addEventListener('pointerup', stopEventTimeAdjustment, true)
+  window.addEventListener('pointercancel', stopEventTimeAdjustment, true)
+  window.addEventListener('blur', stopEventTimeAdjustment)
 })
 
 onUnmounted(() => {
-  window.removeEventListener('pointermove', handleTimeInputDragMove, true)
-  window.removeEventListener('pointerup', handleTimeInputDragEnd, true)
-  window.removeEventListener('pointercancel', handleTimeInputDragEnd, true)
-  window.removeEventListener('blur', cancelTimeInputDrag)
-  cancelTimeInputDrag()
+  stopEventTimeAdjustment()
+  window.removeEventListener('pointerup', stopEventTimeAdjustment, true)
+  window.removeEventListener('pointercancel', stopEventTimeAdjustment, true)
+  window.removeEventListener('blur', stopEventTimeAdjustment)
   if (progressRenderRafId !== null && typeof cancelAnimationFrame !== 'undefined') {
     cancelAnimationFrame(progressRenderRafId)
   }
@@ -830,6 +892,10 @@ onUnmounted(() => {
   if (eventListFollowResumeTimer) {
     clearTimeout(eventListFollowResumeTimer)
     eventListFollowResumeTimer = null
+  }
+  if (eventDeleteConfirmTimer) {
+    clearTimeout(eventDeleteConfirmTimer)
+    eventDeleteConfirmTimer = null
   }
 })
 
@@ -843,7 +909,6 @@ const currentEventOrdinal = computed(() => {
 const handleRowClick = (event: EventItem) => {
   eventDeselectArmed.value = false
   selectEvent(event.id)
-  setDesignViewMode('timeline')
   focusWindow('win-events')
 }
 
@@ -906,6 +971,22 @@ const cancelEdit = () => {
 // 处理删除
 const handleDelete = (id: number, e: MouseEvent) => {
   e.stopPropagation()
+
+  if (pendingDeleteEventId.value !== id) {
+    if (eventDeleteConfirmTimer) clearTimeout(eventDeleteConfirmTimer)
+    pendingDeleteEventId.value = id
+    eventDeleteConfirmTimer = setTimeout(() => {
+      if (pendingDeleteEventId.value === id) {
+        pendingDeleteEventId.value = null
+      }
+      eventDeleteConfirmTimer = null
+    }, 2000)
+    return
+  }
+
+  if (eventDeleteConfirmTimer) clearTimeout(eventDeleteConfirmTimer)
+  eventDeleteConfirmTimer = null
+  pendingDeleteEventId.value = null
   if (editingId.value === id) {
     editingId.value = null
   }
@@ -1027,7 +1108,7 @@ watch(
             'is-drag-before': dragOverEventId === event.id && dragOverPosition === 'before',
             'is-drag-after': dragOverEventId === event.id && dragOverPosition === 'after'
           }"
-          :draggable="editingId !== event.id && !isTimeInputInteracting"
+          :draggable="editingId !== event.id"
           @dragstart="handleEventDragStart(event, $event)"
           @dragover="handleEventDragOver(event, $event)"
           @dragleave="handleEventDragLeave(event, $event)"
@@ -1064,37 +1145,123 @@ watch(
           <!-- 时间列 (对应视频触发时间) -->
           <div class="col-time" @click.stop>
             <div class="event-time-range">
-              <input
-                class="time-input"
-                type="text"
-                inputmode="numeric"
-                draggable="false"
-                placeholder="--:--:--.--"
-                :value="getEventTimeInputValue(event.id, event.time)"
-                @pointerdown.stop="startTimeInputDrag(event.id, 'start', $event)"
-                @dragstart.stop.prevent
-                @click.stop="handleTimeInputClick"
-                @input="handleTimeInput"
-                @focus="handleTimeFocus(event.id, event.time, $event)"
-                @blur="handleTimeBlur(event.id, $event)"
-                @keydown="handleTimeKeydown"
-              />
+              <div
+                class="event-time-field is-start"
+                :class="{
+                  'is-over-video': eventStartExceedsVideoDuration(event)
+                }"
+              >
+                <button
+                  class="event-time-adjust is-left"
+                  :class="{
+                    'is-active': eventTimeAdjustmentKey === getEventTimeAdjustmentKey(event.id, 'start', 'left')
+                  }"
+                  type="button"
+                  aria-label="事件开始提前 1 秒，长按连续调整"
+                  title="事件开始提前 1 秒，长按连续调整"
+                  draggable="false"
+                  @dragstart.stop.prevent
+                  @pointerdown.stop="startEventTimeAdjustment(event.id, 'start', 'left', $event)"
+                  @click.stop="handleEventTimeAdjustmentClick(event.id, 'start', 'left', $event)"
+                  @dblclick.stop
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+                  </svg>
+                </button>
+                <input
+                  class="time-input"
+                  type="text"
+                  inputmode="numeric"
+                  draggable="false"
+                  placeholder="--:--:--"
+                  :value="getEventTimeInputValue(event.id, event.time)"
+                  @pointerdown.stop
+                  @dragstart.stop.prevent
+                  @click.stop
+                  @input="handleTimeInput($event, 'start')"
+                  @focus="handleTimeFocus(event.id, event.time, $event)"
+                  @blur="handleTimeBlur(event.id, $event)"
+                  @keydown="handleTimeKeydown($event, 'start')"
+                />
+                <button
+                  class="event-time-adjust is-right"
+                  :class="{
+                    'is-active': eventTimeAdjustmentKey === getEventTimeAdjustmentKey(event.id, 'start', 'right')
+                  }"
+                  type="button"
+                  aria-label="事件开始延后 1 秒，长按连续调整"
+                  title="事件开始延后 1 秒，长按连续调整"
+                  draggable="false"
+                  @dragstart.stop.prevent
+                  @pointerdown.stop="startEventTimeAdjustment(event.id, 'start', 'right', $event)"
+                  @click.stop="handleEventTimeAdjustmentClick(event.id, 'start', 'right', $event)"
+                  @dblclick.stop
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="m8.59 16.59 1.41 1.41 6-6-6-6-1.41 1.41L13.17 12z" />
+                  </svg>
+                </button>
+              </div>
               <span class="time-range-separator">-</span>
-              <input
-                class="time-input time-input-end"
-                type="text"
-                inputmode="numeric"
-                draggable="false"
-                placeholder="--:--:--.--"
-                :value="getEventEndTimeInputValue(event)"
-                @pointerdown.stop="startTimeInputDrag(event.id, 'end', $event)"
-                @dragstart.stop.prevent
-                @click.stop="handleTimeInputClick"
-                @input="handleTimeInput"
-                @focus="handleEndTimeFocus(event, $event)"
-                @blur="handleEndTimeBlur(event, $event)"
-                @keydown="handleTimeKeydown"
-              />
+              <div
+                class="event-time-field is-end"
+                :class="{
+                  'is-over-video': eventEndExceedsVideoDuration(event)
+                }"
+              >
+                <button
+                  class="event-time-adjust is-left"
+                  :class="{
+                    'is-active': eventTimeAdjustmentKey === getEventTimeAdjustmentKey(event.id, 'end', 'left')
+                  }"
+                  type="button"
+                  aria-label="事件结束提前 1 秒，长按连续调整"
+                  title="事件结束提前 1 秒，长按连续调整"
+                  draggable="false"
+                  @dragstart.stop.prevent
+                  @pointerdown.stop="startEventTimeAdjustment(event.id, 'end', 'left', $event)"
+                  @click.stop="handleEventTimeAdjustmentClick(event.id, 'end', 'left', $event)"
+                  @dblclick.stop
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+                  </svg>
+                </button>
+                <input
+                  class="time-input time-input-end"
+                  type="text"
+                  inputmode="numeric"
+                  draggable="false"
+                  placeholder="--:--:--"
+                  :value="getEventEndTimeInputValue(event)"
+                  @pointerdown.stop
+                  @dragstart.stop.prevent
+                  @click.stop
+                  @input="handleTimeInput($event, 'end')"
+                  @focus="handleEndTimeFocus(event, $event)"
+                  @blur="handleEndTimeBlur(event, $event)"
+                  @keydown="handleTimeKeydown($event, 'end')"
+                />
+                <button
+                  class="event-time-adjust is-right"
+                  :class="{
+                    'is-active': eventTimeAdjustmentKey === getEventTimeAdjustmentKey(event.id, 'end', 'right')
+                  }"
+                  type="button"
+                  aria-label="事件结束延后 1 秒，长按连续调整"
+                  title="事件结束延后 1 秒，长按连续调整"
+                  draggable="false"
+                  @dragstart.stop.prevent
+                  @pointerdown.stop="startEventTimeAdjustment(event.id, 'end', 'right', $event)"
+                  @click.stop="handleEventTimeAdjustmentClick(event.id, 'end', 'right', $event)"
+                  @dblclick.stop
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="m8.59 16.59 1.41 1.41 6-6-6-6-1.41 1.41L13.17 12z" />
+                  </svg>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1136,8 +1303,10 @@ watch(
             </button>
             <button
               class="row-action-btn delete-btn"
+              :class="{ 'is-confirming': pendingDeleteEventId === event.id }"
               type="button"
-              aria-label="删除事件"
+              :aria-label="pendingDeleteEventId === event.id ? '再次点击确认删除事件' : '删除事件'"
+              :title="pendingDeleteEventId === event.id ? '再次点击确认删除' : '删除事件'"
               @mousedown.prevent
               @click.stop="handleDelete(event.id, $event)"
             >
@@ -1386,8 +1555,8 @@ watch(
 
 /* 时间列 */
 .col-time {
-  width: 192px;
-  min-width: 192px;
+  width: 240px;
+  min-width: 240px;
   padding: 0 4px;
   display: flex;
   align-items: center;
@@ -1397,14 +1566,103 @@ watch(
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 4px;
   width: 100%;
   min-width: 0;
 }
 
+.event-time-field.is-over-video .time-input {
+  border-color: rgba(249, 217, 118, 0.68);
+  background-color: rgba(249, 217, 118, 0.12);
+  color: #f9d976;
+}
+
+.event-time-field.is-over-video .time-input:hover {
+  border-color: rgba(249, 217, 118, 0.86);
+  background-color: rgba(249, 217, 118, 0.18);
+}
+
+.event-time-field.is-over-video .time-input:focus {
+  border-color: #f9d976;
+  background-color: rgba(249, 217, 118, 0.2);
+  color: #f9d976;
+  box-shadow: 0 0 0 1px rgba(249, 217, 118, 0.82);
+}
+
+.event-time-field.is-over-video .event-time-adjust {
+  background-color: rgba(249, 217, 118, 0.14);
+  color: #f9d976;
+}
+
+.event-time-field.is-over-video .event-time-adjust:hover,
+.event-time-field.is-over-video .event-time-adjust:focus-visible {
+  background-color: rgba(249, 217, 118, 0.26);
+  color: #ffe49a;
+}
+
+.event-time-field.is-over-video .event-time-adjust.is-active {
+  background-color: #f9d976;
+  color: #211a00;
+}
+
+.event-time-field {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.event-time-adjust {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  min-width: 18px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(138, 180, 248, 0.12);
+  color: var(--md-sys-color-primary, #8ab4f8);
+  cursor: pointer;
+  outline: none;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.88);
+  transition:
+    opacity 140ms cubic-bezier(0.2, 0, 0, 1),
+    transform 140ms cubic-bezier(0.2, 0, 0, 1),
+    background-color 140ms cubic-bezier(0.2, 0, 0, 1),
+    color 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.events-table-row:hover .event-time-adjust,
+.event-time-adjust:focus-visible,
+.event-time-adjust.is-active {
+  opacity: 1;
+  pointer-events: auto;
+  transform: scale(1);
+}
+
+.event-time-adjust:hover,
+.event-time-adjust:focus-visible {
+  background: rgba(138, 180, 248, 0.26);
+  color: #ffffff;
+}
+
+.event-time-adjust.is-active {
+  background: var(--md-sys-color-primary, #8ab4f8);
+  color: var(--md-sys-color-on-primary, #042a59);
+}
+
+.event-time-adjust svg {
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+
 .time-input {
-  width: 78px;
-  min-width: 78px;
+  width: 68px;
+  min-width: 68px;
   height: 22px;
   box-sizing: border-box;
   padding: 0 4px;
@@ -1416,8 +1674,7 @@ watch(
   font-size: 11px;
   font-weight: 500;
   text-align: center;
-  cursor: ew-resize;
-  touch-action: none;
+  cursor: text;
   outline: none;
   transition:
     border-color 0.15s ease,
@@ -1539,6 +1796,13 @@ watch(
 .row-action-btn.delete-btn:hover {
   background-color: rgba(239, 107, 115, 0.18);
   color: #f2b8b5;
+}
+
+.row-action-btn.delete-btn.is-confirming {
+  background-color: rgba(242, 184, 181, 0.24);
+  color: #f2b8b5;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .row-action-btn.save-btn:hover {

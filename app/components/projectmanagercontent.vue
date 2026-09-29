@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, nextTick } from 'vue'
+import { PROJECT_FORMAT_VERSION } from '~/composables/projectmanager'
 import { statusBarNoticeManager } from '~/composables/statusbarnotice'
 
 const { closeProjectManagerWindow } = windowsManager()
@@ -83,7 +84,7 @@ const handleFileChange = async (event: Event) => {
     const project = await openProjectFromFile(file)
     showProjectSuccessNotice('成功读取项目')
 
-    // 有已保存窗口布局时保留原布局，旧项目则生成默认四宫格
+    // 有已保存窗口布局时保留原布局，否则生成默认四宫格
     const savedWindows = project.data?.windows?.items
     const hasSavedLayout = Array.isArray(savedWindows) &&
       savedWindows.some((windowItem: any) => windowItem?.id && windowItem.id !== 'win-project-manager')
@@ -237,7 +238,7 @@ const handleFileChange = async (event: Event) => {
     <div class="project-manager-footer">
       <div class="format-badge">
         <span class="badge-dot" />
-        <span class="badge-label">工程格式：*.lseproj</span>
+        <span class="badge-label">工程格式：*.lseproj · {{ PROJECT_FORMAT_VERSION }}</span>
       </div>
       <span class="app-version">版本 {{ APP_VERSION }}</span>
     </div>

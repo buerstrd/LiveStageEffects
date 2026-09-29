@@ -9,8 +9,8 @@ const {
   toggleShowSeconds,
   statusBarBeatIndicator,
   toggleStatusBarBeatIndicator,
-  disableAnimations,
-  toggleDisableAnimations
+  clearBrowserCacheOnStartup,
+  toggleClearBrowserCacheOnStartup
 } = settingsManager()
 const { requestResetWorkspaceLayout } = windowsManager()
 const {
@@ -378,29 +378,29 @@ const currentCategoryId = useState<string>('settings_current_category', () => 'd
               class="setting-item-row"
               role="button"
               tabindex="0"
-              @click="toggleDisableAnimations"
-              @keydown.space.prevent="toggleDisableAnimations"
-              @keydown.enter.prevent="toggleDisableAnimations"
+              @click="toggleClearBrowserCacheOnStartup"
+              @keydown.space.prevent="toggleClearBrowserCacheOnStartup"
+              @keydown.enter.prevent="toggleClearBrowserCacheOnStartup"
             >
               <div class="item-leading-icon">
-                <!-- Material Icons speed -->
+                <!-- Material Icons delete_sweep -->
                 <svg class="pref-icon" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M20.38 8.57l-1.23 1.85a8 8 0 0 1-.22 7.58H5.07A8 8 0 0 1 15.58 6.85l1.85-1.23A10 10 0 0 0 3.35 19a2 2 0 0 0 1.72 1h13.85a2 2 0 0 0 1.74-1 10 10 0 0 0-.28-10.43zM10.59 15.41a2 2 0 0 0 2.83 0l5.66-8.49-8.49 5.66a2 2 0 0 0 0 2.83z" />
+                  <path d="M15 16h4v2h-4v-2zm0-8h7v2h-7V8zm0 4h6v2h-6v-2zM3 18c0 1.1.9 2 2 2h6c1.1 0 2-.9 2-2V8H3v10zM14 5h-3l-1-1H6L5 5H2v2h12V5z" />
                 </svg>
               </div>
 
               <div class="item-text">
-                <span class="item-title">关闭所有动画效果</span>
-                <span class="item-subtitle">关闭界面过渡、水波纹与窗口动画</span>
+                <span class="item-title">不保留缓存</span>
+                <span class="item-subtitle">启动时自动清理浏览器缓存，保持干净状态</span>
               </div>
 
               <button
                 class="md3-switch"
-                :class="{ checked: disableAnimations }"
+                :class="{ checked: clearBrowserCacheOnStartup }"
                 type="button"
                 role="switch"
-                :aria-checked="disableAnimations"
-                @click.stop="toggleDisableAnimations"
+                :aria-checked="clearBrowserCacheOnStartup"
+                @click.stop="toggleClearBrowserCacheOnStartup"
               >
                 <span class="md3-switch-thumb" />
               </button>

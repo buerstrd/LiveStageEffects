@@ -1,14 +1,21 @@
 import { computed, watch } from 'vue'
 import { projectManager } from '~/composables/projectmanager'
-import { presetsManager, type PresetItem } from '~/composables/presetsmanager'
 import { devicesManager } from '~/composables/devicesmanager'
 import { videoManager } from '~/composables/videomanager'
+import {
+  createDefaultEffect,
+  normalizePresetEffect,
+  normalizePresetItem,
+  type PresetItem,
+  type PresetLightEffect
+} from '~/utils/presetcurve'
 
 export interface EventPresetTrigger {
   id: number
   presetId: number
   time?: string // 相对事件开始时间，例如 "00:00.00"
   track?: number // 时间线轨道索引，从 0 开始
+  duration?: number // 单次时间线片段时长覆盖值（毫秒），不修改预设
 }
 
 export interface EventItem {
@@ -18,11 +25,16 @@ export interface EventItem {
   endTime?: string // 终止时间；留空时按全部预设触发器自动计算
   presetTriggers: EventPresetTrigger[]
   timelineTrackCount?: number
+  presets: PresetItem[]
 }
 
 export type EventMovePosition = 'before' | 'after'
 
-const DEFAULT_EVENT_DURATION_SECONDS = 30
+const DEFAULT_EVENT_DURATION_SECONDS = 180
+const DEFAULT_EVENT_PRESET_COUNT = 30
+const DEFAULT_EVENT_TRACK_COUNT = 3
+const EVENT_PRESET_MIN_DURATION_MS = 50
+const EVENT_PRESET_MAX_DURATION_MS = 24 * 60 * 60 * 1000
 
 // 解析时间字符串（如 "01:23" 或 "83"）为秒数
 export const parseTimeToSeconds = (input: string | number | undefined | null): number => {
@@ -87,13 +99,12 @@ export const formatTriggerTime = (seconds: number, forceHours = false): string =
   return `${mm}:${ss}`
 }
 
-export const getEventPresetTriggers = (event: EventItem): EventPresetTrigger[] => {
-  if (Array.isArray(event.presetTriggers)) return event.presetTriggers
+export const formatTimelineTime = (seconds: number, forceHours = false): string => {
+  return formatTriggerTime(seconds, forceHours).replace(/\.\d+$/, '')
+}
 
-  const legacyPresetId = (event as EventItem & { presetId?: number | null }).presetId
-  return typeof legacyPresetId === 'number' && legacyPresetId > 0
-    ? [{ id: 1, presetId: legacyPresetId, time: '00:00.00' }]
-    : []
+export const getEventPresetTriggers = (event: EventItem): EventPresetTrigger[] => {
+  return Array.isArray(event.presetTriggers) ? event.presetTriggers : []
 }
 
 export const normalizeTimelineTrackIndex = (value: unknown): number => {
@@ -117,8 +128,7 @@ export const normalizeEventTimelineTrackCount = (
 }
 
 export const normalizeEventPresetTriggers = (
-  input: unknown,
-  legacyPresetId?: number | null
+  input: unknown
 ): EventPresetTrigger[] => {
   const source = Array.isArray(input) ? input : []
   const triggers: EventPresetTrigger[] = []
@@ -137,26 +147,59 @@ export const normalizeEventPresetTriggers = (
       : triggers.length + 1
     while (usedIds.has(id)) id++
     usedIds.add(id)
+    const duration = Number.isFinite(trigger.duration)
+      ? Math.max(
+          EVENT_PRESET_MIN_DURATION_MS,
+          Math.min(
+            EVENT_PRESET_MAX_DURATION_MS,
+            Math.round(Number(trigger.duration))
+          )
+        )
+      : undefined
     triggers.push({
       id,
       presetId: trigger.presetId,
       time: typeof trigger.time === 'string' && isValidTriggerTime(trigger.time)
         ? formatTriggerTime(parseTimeToSeconds(trigger.time))
         : '00:00.00',
-      track: normalizeTimelineTrackIndex(trigger.track)
+      track: normalizeTimelineTrackIndex(trigger.track),
+      ...(duration === undefined ? {} : { duration })
     })
   }
 
-  if (
-    triggers.length === 0 &&
-    typeof legacyPresetId === 'number' &&
-    Number.isInteger(legacyPresetId) &&
-    legacyPresetId > 0
-  ) {
-    triggers.push({ id: 1, presetId: legacyPresetId, time: '00:00.00', track: 0 })
-  }
-
   return triggers
+}
+
+const normalizeEventPresets = (
+  input: unknown,
+  eventId: number
+): PresetItem[] => {
+  const source = Array.isArray(input) ? input : []
+  const usedIds = new Set<number>()
+  return source.map((preset, index) => {
+    const normalized = normalizePresetItem(preset, index)
+    let id = normalized.id
+    while (usedIds.has(id)) id++
+    usedIds.add(id)
+    return {
+      ...normalized,
+      id,
+      name: `${eventId}-${id}`
+    }
+  })
+}
+
+export const getEventPresets = (event: EventItem): PresetItem[] => {
+  if (!Array.isArray(event.presets)) {
+    event.presets = []
+  }
+  return event.presets
+}
+
+const syncEventPresetNames = (event: EventItem) => {
+  getEventPresets(event).forEach((preset) => {
+    preset.name = `${event.id}-${preset.id}`
+  })
 }
 
 const ensureEventPresetTriggers = (event: EventItem): EventPresetTrigger[] => {
@@ -166,12 +209,28 @@ const ensureEventPresetTriggers = (event: EventItem): EventPresetTrigger[] => {
   return event.presetTriggers
 }
 
-export const getPresetPlaybackDurationMs = (preset: PresetItem): number => {
-  const effectDuration = preset.effect?.duration || 2000
-  const effectRepeat = typeof preset.effect?.repeat === 'number'
-    ? preset.effect.repeat
-    : 1
-  return Math.max(200, effectDuration * (effectRepeat > 0 ? effectRepeat : 1))
+export const getPresetSingleDurationMs = (
+  preset: PresetItem,
+  durationOverride?: number
+): number => {
+  if (Number.isFinite(durationOverride)) {
+    return Math.max(
+      EVENT_PRESET_MIN_DURATION_MS,
+      Math.min(
+        EVENT_PRESET_MAX_DURATION_MS,
+        Math.round(Number(durationOverride))
+      )
+    )
+  }
+  return Math.max(50, Math.round(preset.effect?.duration || 2000))
+}
+
+export const getPresetPlaybackDurationMs = (
+  preset: PresetItem,
+  durationOverride?: number
+): number => {
+  // 时间线片段只使用自身时长；预设时长仅作为拖入时生成片段默认值的来源。
+  return getPresetSingleDurationMs(preset, durationOverride)
 }
 
 export const getEventAutoEndTimeSeconds = (
@@ -180,7 +239,7 @@ export const getEventAutoEndTimeSeconds = (
 ): number | null => {
   if (!isValidTriggerTime(event.time)) return null
 
-  const presets = availablePresets ?? presetsManager().presets.value
+  const presets = availablePresets ?? getEventPresets(event)
   const eventStartTime = parseTimeToSeconds(event.time)
   let latestEndTime = eventStartTime
 
@@ -191,9 +250,14 @@ export const getEventAutoEndTimeSeconds = (
     const triggerStartTime = eventStartTime + (
       isValidTriggerTime(trigger.time) ? parseTimeToSeconds(trigger.time) : 0
     )
+    const playbackDurationMs = getPresetPlaybackDurationMs(
+      preset,
+      trigger.duration
+    )
+    if (!Number.isFinite(playbackDurationMs)) continue
     latestEndTime = Math.max(
       latestEndTime,
-      triggerStartTime + getPresetPlaybackDurationMs(preset) / 1000
+      triggerStartTime + playbackDurationMs / 1000
     )
   }
 
@@ -236,7 +300,9 @@ export interface EventPresetPlayback {
   startTime: number
   endTime: number
   durationMs: number
+  singleDurationMs: number
   totalRepeat: number
+  visualRepeat: number
   track: number
 }
 
@@ -246,7 +312,7 @@ export const getEventPresetPlaybacks = (
 ): EventPresetPlayback[] => {
   if (!isValidTriggerTime(event.time)) return []
 
-  const presets = availablePresets ?? presetsManager().presets.value
+  const presets = availablePresets ?? getEventPresets(event)
   const eventStartTime = parseTimeToSeconds(event.time)
   const eventEndTime = getEventEndTimeSeconds(event, presets)
   if (eventEndTime === null || eventEndTime <= eventStartTime) return []
@@ -259,13 +325,19 @@ export const getEventPresetPlaybacks = (
     const triggerStartTime = eventStartTime + (
       isValidTriggerTime(trigger.time) ? parseTimeToSeconds(trigger.time) : 0
     )
-    const triggerEndTime = Math.min(
-      eventEndTime,
-      triggerStartTime + getPresetPlaybackDurationMs(preset) / 1000
+    const singleDurationMs = getPresetSingleDurationMs(
+      preset,
+      trigger.duration
     )
+    const playbackDurationMs = getPresetPlaybackDurationMs(
+      preset,
+      trigger.duration
+    )
+    const triggerEndTime = Number.isFinite(playbackDurationMs)
+      ? Math.min(eventEndTime, triggerStartTime + playbackDurationMs / 1000)
+      : eventEndTime
     if (triggerEndTime <= triggerStartTime) continue
 
-    const presetRepeat = typeof preset.effect?.repeat === 'number' ? preset.effect.repeat : 1
     playbacks.push({
       eventId: event.id,
       triggerId: trigger.id,
@@ -273,7 +345,9 @@ export const getEventPresetPlaybacks = (
       startTime: triggerStartTime,
       endTime: triggerEndTime,
       durationMs: (triggerEndTime - triggerStartTime) * 1000,
-      totalRepeat: presetRepeat === 0 ? 0 : Math.max(1, presetRepeat),
+      singleDurationMs,
+      totalRepeat: 1,
+      visualRepeat: 1,
       track: normalizeTimelineTrackIndex(trigger.track)
     })
   }
@@ -327,28 +401,53 @@ export const eventsManager = () => {
   )
   const eventPlayProgress = useState<number>('playlist_event_progress', () => 0) // 0.0 ~ 1.0
   const isEventRecording = useState<boolean>('events_recording_active', () => false)
+  const eventPresetStoreInitialized = useState<boolean>(
+    'app_events_presets_initialized',
+    () => false
+  )
 
-  // 若已载入工程且本地为空，优先同步工程内事件
-  if (
-    currentProject.value?.data?.events &&
-    Array.isArray(currentProject.value.data.events) &&
-    events.value.length === 0 &&
-    currentProject.value.data.events.length > 0
-  ) {
-    events.value = currentProject.value.data.events.map((e: any, idx: number) => {
-      const presetTriggers = normalizeEventPresetTriggers(e.presetTriggers, e.presetId)
+  // 统一事件私有预设与时间线触发器格式。
+  const sourceEvents = events.value.length > 0
+    ? events.value
+    : (
+        currentProject.value?.data?.events &&
+        Array.isArray(currentProject.value.data.events)
+          ? currentProject.value.data.events
+          : []
+  )
+  if (!eventPresetStoreInitialized.value && sourceEvents.length > 0) {
+    events.value = sourceEvents.map((e: any, idx: number) => {
+      const eventId = typeof e.id === 'number' ? e.id : idx + 1
+      const eventPresets = normalizeEventPresets(e.presets, eventId)
+      let presetTriggers = normalizeEventPresetTriggers(e.presetTriggers)
+
+      const availablePresetIds = new Set(eventPresets.map(preset => preset.id))
+      const presetsById = new Map(
+        eventPresets.map(preset => [preset.id, preset])
+      )
+      presetTriggers = presetTriggers.filter(
+        trigger => availablePresetIds.has(trigger.presetId)
+      ).map(trigger => ({
+        ...trigger,
+        duration: getPresetSingleDurationMs(
+          presetsById.get(trigger.presetId)!,
+          trigger.duration
+        )
+      }))
       return {
-        id: typeof e.id === 'number' ? e.id : idx + 1,
+        id: eventId,
         name: e.name || `事件 ${idx + 1}`,
         time: typeof e.time === 'string' && isValidTriggerTime(e.time) ? e.time : '',
         endTime: typeof e.endTime === 'string' ? e.endTime.trim() : '',
         presetTriggers,
+        presets: eventPresets,
         timelineTrackCount: normalizeEventTimelineTrackCount(
           e.timelineTrackCount,
           presetTriggers
         )
       }
     })
+    eventPresetStoreInitialized.value = true
   }
 
   const syncToProject = () => {
@@ -358,11 +457,17 @@ export const eventsManager = () => {
         name: e.name,
         time: typeof e.time === 'string' ? e.time.trim() : '',
         endTime: typeof e.endTime === 'string' ? e.endTime.trim() : '',
+        presets: getEventPresets(e).map((preset, index) => (
+          normalizePresetItem(preset, index)
+        )),
         presetTriggers: getEventPresetTriggers(e).map(trigger => ({
           id: trigger.id,
           presetId: trigger.presetId,
           time: typeof trigger.time === 'string' ? trigger.time.trim() : '00:00.00',
-          track: normalizeTimelineTrackIndex(trigger.track)
+          track: normalizeTimelineTrackIndex(trigger.track),
+          ...(Number.isFinite(trigger.duration)
+            ? { duration: trigger.duration }
+            : {})
         })),
         timelineTrackCount: normalizeEventTimelineTrackCount(
           e.timelineTrackCount,
@@ -388,7 +493,19 @@ export const eventsManager = () => {
       time: formatTriggerTime(startTime),
       endTime: formatTriggerTime(startTime + DEFAULT_EVENT_DURATION_SECONDS),
       presetTriggers: [],
-      timelineTrackCount: 0
+      timelineTrackCount: DEFAULT_EVENT_TRACK_COUNT,
+      presets: Array.from(
+        { length: DEFAULT_EVENT_PRESET_COUNT },
+        (_, index) => {
+          const presetId = index + 1
+          return {
+            id: presetId,
+            name: `${nextId}-${presetId}`,
+            shortcut: '',
+            effect: createDefaultEffect()
+          }
+        }
+      )
     }
 
     events.value.push(newEvent)
@@ -452,19 +569,22 @@ export const eventsManager = () => {
     syncToProject()
   }
 
-  const addEventPresetTrigger = (
+  const addEventPresetTriggers = (
     eventId: number,
     presetId: number,
-    offsetSeconds?: number,
-    trackIndex = 0
-  ): EventPresetTrigger | null => {
+    offsetSecondsList: Array<number | undefined>,
+    trackIndex = 0,
+    durationOverride?: number
+  ): EventPresetTrigger[] => {
     const event = events.value.find(e => e.id === eventId)
     if (
       !event ||
       !Number.isInteger(presetId) ||
-      presetId < 1
+      presetId < 1 ||
+      !getEventPresets(event).some(preset => preset.id === presetId) ||
+      offsetSecondsList.length === 0
     ) {
-      return null
+      return []
     }
 
     const triggers = ensureEventPresetTriggers(event)
@@ -473,29 +593,203 @@ export const eventsManager = () => {
       : 0
     const hasExplicitEndTime = typeof event.endTime === 'string' && !!event.endTime.trim()
     const eventEndTime = hasExplicitEndTime ? getEventEndTimeSeconds(event) : null
-    const requestedOffset = typeof offsetSeconds === 'number' && Number.isFinite(offsetSeconds)
-      ? Math.max(0, offsetSeconds)
-      : Math.max(0, videoCurrentTime.value - eventStartTime)
     const offsetLimit = eventEndTime === null
-      ? requestedOffset
+      ? null
       : Math.max(0, eventEndTime - eventStartTime - 0.01)
     const nextId = triggers.length > 0
       ? Math.max(...triggers.map(trigger => trigger.id)) + 1
       : 1
-    const trigger: EventPresetTrigger = {
-      id: nextId,
-      presetId,
-      time: formatTriggerTime(Math.min(requestedOffset, offsetLimit)),
-      track: normalizeTimelineTrackIndex(trackIndex)
-    }
+    const normalizedTrackIndex = normalizeTimelineTrackIndex(trackIndex)
+    const preset = getEventPresets(event).find(item => item.id === presetId)!
+    const normalizedDuration = Number.isFinite(durationOverride)
+      ? Math.max(
+          EVENT_PRESET_MIN_DURATION_MS,
+          Math.min(
+            EVENT_PRESET_MAX_DURATION_MS,
+            Math.round(Number(durationOverride))
+          )
+        )
+      : getPresetSingleDurationMs(preset)
+    const newTriggers = offsetSecondsList.map((offsetSeconds, index) => {
+      const requestedOffset = (
+        typeof offsetSeconds === 'number' &&
+        Number.isFinite(offsetSeconds)
+      )
+        ? Math.max(0, offsetSeconds)
+        : Math.max(0, videoCurrentTime.value - eventStartTime)
+      const triggerOffset = offsetLimit === null
+        ? requestedOffset
+        : Math.min(requestedOffset, offsetLimit)
 
-    triggers.push(trigger)
+      return {
+        id: nextId + index,
+        presetId,
+        time: formatTriggerTime(triggerOffset),
+        track: normalizedTrackIndex,
+        duration: normalizedDuration
+      }
+    })
+
+    triggers.push(...newTriggers)
     event.timelineTrackCount = normalizeEventTimelineTrackCount(
       event.timelineTrackCount,
       triggers
     )
     syncToProject()
-    return trigger
+    return newTriggers
+  }
+
+  const addEventPresetTrigger = (
+    eventId: number,
+    presetId: number,
+    offsetSeconds?: number,
+    trackIndex = 0,
+    durationOverride?: number
+  ): EventPresetTrigger | null => {
+    return addEventPresetTriggers(
+      eventId,
+      presetId,
+      [offsetSeconds],
+      trackIndex,
+      durationOverride
+    )[0] ?? null
+  }
+
+  const importPresetToEvent = (
+    eventId: number,
+    sourcePreset: PresetItem
+  ): PresetItem | null => {
+    const event = events.value.find(item => item.id === eventId)
+    if (!event) return null
+
+    const eventPresets = getEventPresets(event)
+    const nextPresetId = eventPresets.length > 0
+      ? Math.max(...eventPresets.map(preset => preset.id)) + 1
+      : 1
+    const localPreset = normalizePresetItem({
+      ...sourcePreset,
+      id: nextPresetId,
+      name: `${eventId}-${nextPresetId}`,
+      shortcut: ''
+    }, nextPresetId - 1)
+    eventPresets.push(localPreset)
+    syncToProject()
+    return localPreset
+  }
+
+  const addEventPreset = (eventId: number): PresetItem | null => {
+    const event = events.value.find(item => item.id === eventId)
+    if (!event) return null
+
+    const eventPresets = getEventPresets(event)
+    const nextPresetId = eventPresets.length > 0
+      ? Math.max(...eventPresets.map(preset => preset.id)) + 1
+      : 1
+    const preset: PresetItem = {
+      id: nextPresetId,
+      name: `${eventId}-${nextPresetId}`,
+      shortcut: '',
+      effect: createDefaultEffect()
+    }
+    eventPresets.push(preset)
+    syncToProject()
+    return preset
+  }
+
+  const removeEventPreset = (eventId: number, presetId: number) => {
+    const event = events.value.find(item => item.id === eventId)
+    if (!event) return
+
+    const eventPresets = getEventPresets(event)
+    const presetIndex = eventPresets.findIndex(preset => preset.id === presetId)
+    if (presetIndex === -1) return
+
+    eventPresets.splice(presetIndex, 1)
+    const retainedTriggers = getEventPresetTriggers(event).filter(
+      trigger => trigger.presetId !== presetId
+    )
+    event.presetTriggers = retainedTriggers
+    event.timelineTrackCount = normalizeEventTimelineTrackCount(
+      event.timelineTrackCount,
+      retainedTriggers
+    )
+    syncToProject()
+  }
+
+  const updateEventPresetEffect = (
+    eventId: number,
+    presetId: number,
+    partialEffect: Partial<PresetLightEffect>
+  ) => {
+    const event = events.value.find(item => item.id === eventId)
+    const preset = event
+      ? getEventPresets(event).find(item => item.id === presetId)
+      : null
+    if (!preset) return
+
+    preset.effect = normalizePresetEffect({
+      ...(preset.effect ?? createDefaultEffect()),
+      ...partialEffect
+    })
+    syncToProject()
+  }
+
+  const updateEventPresetShortcut = (
+    eventId: number,
+    presetId: number,
+    shortcut: string
+  ) => {
+    const event = events.value.find(item => item.id === eventId)
+    if (!event) return
+
+    const eventPresets = getEventPresets(event)
+    const normalized = shortcut.trim()
+    if (normalized) {
+      eventPresets.forEach(preset => {
+        if (
+          preset.id !== presetId &&
+          typeof preset.shortcut === 'string' &&
+          preset.shortcut.trim().toUpperCase() === normalized.toUpperCase()
+        ) {
+          preset.shortcut = ''
+        }
+      })
+    }
+
+    const preset = eventPresets.find(item => item.id === presetId)
+    if (!preset) return
+
+    preset.shortcut = normalized
+    syncToProject()
+  }
+
+  const moveEventPreset = (
+    eventId: number,
+    draggedId: number,
+    targetId: number,
+    position: 'before' | 'after'
+  ) => {
+    if (draggedId === targetId) return
+
+    const event = events.value.find(item => item.id === eventId)
+    if (!event) return
+
+    const eventPresets = getEventPresets(event)
+    const fromIndex = eventPresets.findIndex(preset => preset.id === draggedId)
+    if (fromIndex === -1) return
+
+    const [movedPreset] = eventPresets.splice(fromIndex, 1)
+    if (!movedPreset) return
+
+    const targetIndex = eventPresets.findIndex(preset => preset.id === targetId)
+    if (targetIndex === -1) {
+      eventPresets.splice(fromIndex, 0, movedPreset)
+      return
+    }
+
+    const insertIndex = position === 'before' ? targetIndex : targetIndex + 1
+    eventPresets.splice(insertIndex, 0, movedPreset)
+    syncToProject()
   }
 
   const addEventTimelineTrack = (eventId: number): number => {
@@ -560,16 +854,74 @@ export const eventsManager = () => {
     syncToProject()
   }
 
-  const removeEventPresetTrigger = (eventId: number, triggerId: number) => {
+  const updateEventPresetTriggerRange = (
+    eventId: number,
+    triggerId: number,
+    offsetSeconds: number,
+    durationMs: number
+  ) => {
     const event = events.value.find(e => e.id === eventId)
-    if (!event) return
+    const trigger = event
+      ? ensureEventPresetTriggers(event).find(item => item.id === triggerId)
+      : null
+    if (!event || !trigger) return
+
+    const eventStartTime = isValidTriggerTime(event.time)
+      ? parseTimeToSeconds(event.time)
+      : 0
+    const hasExplicitEndTime = typeof event.endTime === 'string'
+      && !!event.endTime.trim()
+    const eventEndTime = hasExplicitEndTime ? getEventEndTimeSeconds(event) : null
+    const nextOffset = Math.max(0, Math.min(
+      Number.isFinite(eventEndTime)
+        ? Math.max(
+            0,
+            (eventEndTime as number) - eventStartTime
+              - EVENT_PRESET_MIN_DURATION_MS / 1000
+          )
+        : Number.POSITIVE_INFINITY,
+      offsetSeconds
+    ))
+    const maxDurationSeconds = eventEndTime === null
+      ? Number.POSITIVE_INFINITY
+      : Math.max(
+          EVENT_PRESET_MIN_DURATION_MS / 1000,
+          eventEndTime - eventStartTime - nextOffset
+        )
+    const nextDuration = Math.max(
+      EVENT_PRESET_MIN_DURATION_MS,
+      Math.min(
+        EVENT_PRESET_MAX_DURATION_MS,
+        Math.round(durationMs),
+        maxDurationSeconds * 1000
+      )
+    )
+
+    trigger.time = formatTriggerTime(nextOffset)
+    trigger.duration = nextDuration
+    syncToProject()
+  }
+
+  const removeEventPresetTriggers = (
+    eventId: number,
+    triggerIds: number[]
+  ) => {
+    const event = events.value.find(e => e.id === eventId)
+    if (!event || triggerIds.length === 0) return
 
     const triggers = ensureEventPresetTriggers(event)
-    const triggerIndex = triggers.findIndex(trigger => trigger.id === triggerId)
-    if (triggerIndex === -1) return
+    const triggerIdSet = new Set(triggerIds)
+    const nextTriggers = triggers.filter(
+      trigger => !triggerIdSet.has(trigger.id)
+    )
+    if (nextTriggers.length === triggers.length) return
 
-    triggers.splice(triggerIndex, 1)
+    triggers.splice(0, triggers.length, ...nextTriggers)
     syncToProject()
+  }
+
+  const removeEventPresetTrigger = (eventId: number, triggerId: number) => {
+    removeEventPresetTriggers(eventId, [triggerId])
   }
 
   const updateEventPresetTriggerTrack = (
@@ -591,19 +943,74 @@ export const eventsManager = () => {
     syncToProject()
   }
 
-  const recordPresetEvent = (preset: Pick<PresetItem, 'id' | 'name'>): EventItem | null => {
+  const updateEventPresetTriggers = (
+    eventId: number,
+    updates: Array<{
+      triggerId: number
+      offsetSeconds: number
+      track: number
+    }>
+  ) => {
+    const event = events.value.find(e => e.id === eventId)
+    if (!event || updates.length === 0) return
+
+    const triggers = ensureEventPresetTriggers(event)
+    const triggerById = new Map(triggers.map(trigger => [trigger.id, trigger]))
+    const eventStartTime = isValidTriggerTime(event.time)
+      ? parseTimeToSeconds(event.time)
+      : 0
+    const hasExplicitEndTime = typeof event.endTime === 'string'
+      && !!event.endTime.trim()
+    const eventEndTime = hasExplicitEndTime ? getEventEndTimeSeconds(event) : null
+    const offsetLimit = eventEndTime === null
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, eventEndTime - eventStartTime - 0.01)
+    let changed = false
+
+    for (const update of updates) {
+      const trigger = triggerById.get(update.triggerId)
+      if (!trigger || !Number.isFinite(update.offsetSeconds)) continue
+
+      const nextTime = formatTriggerTime(Math.min(
+        Math.max(0, update.offsetSeconds),
+        offsetLimit
+      ))
+      const nextTrack = normalizeTimelineTrackIndex(update.track)
+      if (trigger.time === nextTime && trigger.track === nextTrack) continue
+
+      trigger.time = nextTime
+      trigger.track = nextTrack
+      changed = true
+    }
+
+    if (!changed) return
+    event.timelineTrackCount = normalizeEventTimelineTrackCount(
+      event.timelineTrackCount,
+      getEventPresetTriggers(event)
+    )
+    syncToProject()
+  }
+
+  const recordPresetEvent = (
+    preset: PresetItem,
+    sourceEventId?: number
+  ): EventItem | null => {
     if (!isEventRecording.value || selectedEventId.value === null) return null
 
     const { currentTime } = videoManager()
     const selectedEvent = events.value.find(event => event.id === selectedEventId.value)
     if (!selectedEvent) return null
+    const localPreset = sourceEventId === selectedEvent.id
+      ? getEventPresets(selectedEvent).find(item => item.id === preset.id) ?? null
+      : importPresetToEvent(selectedEvent.id, preset)
+    if (!localPreset) return null
 
     const eventStartTime = isValidTriggerTime(selectedEvent.time)
       ? parseTimeToSeconds(selectedEvent.time)
       : currentTime.value
     addEventPresetTrigger(
       selectedEvent.id,
-      preset.id,
+      localPreset.id,
       Math.max(0, currentTime.value - eventStartTime)
     )
     return selectedEvent
@@ -631,6 +1038,7 @@ export const eventsManager = () => {
     // 拖动后按实际顺序重新编排连续 ID
     nextEvents.forEach((event, index) => {
       event.id = index + 1
+      syncEventPresetNames(event)
     })
     events.value = nextEvents
 
@@ -652,21 +1060,37 @@ export const eventsManager = () => {
   }
 
   const sendActiveEventPlaybackToDevice = (playback: EventPresetPlayback, elapsedMs: number) => {
-    const { sendPresetToDevice, seekDevicePlayback } = devicesManager()
+    const {
+      sendPresetToDevice,
+      seekDevicePlayback,
+      syncDevicePlaybackTime
+    } = devicesManager()
+    const timelineDurationMs = Math.max(
+      EVENT_PRESET_MIN_DURATION_MS,
+      Math.round(playback.durationMs)
+    )
+    const playbackElapsedMs = Math.max(
+      0,
+      Math.min(playback.durationMs, elapsedMs)
+    )
     sendPresetToDevice({
       ...playback.preset,
       effect: playback.preset.effect
-        ? { ...playback.preset.effect, repeat: playback.totalRepeat }
+        ? {
+            ...playback.preset.effect,
+            duration: timelineDurationMs,
+            repeat: playback.totalRepeat
+          }
         : playback.preset.effect
-    })
-    seekDevicePlayback(Math.max(0, elapsedMs))
+    }, timelineDurationMs, 'timeline', playbackElapsedMs)
+    syncDevicePlaybackTime(playbackElapsedMs)
+    seekDevicePlayback(playbackElapsedMs)
   }
 
   const syncActiveEventToVideoTime = (time: number, seekOutput = false) => {
-    const presets = presetsManager().presets.value
     const previousTopPlayback = getTopActiveEventPlayback()
     const nextStack = events.value
-      .flatMap(event => getEventPresetPlaybacksAtTime(event, time, presets))
+      .flatMap(event => getEventPresetPlaybacksAtTime(event, time))
       .sort((a, b) => (
         a.startTime - b.startTime ||
         b.durationMs - a.durationMs ||
@@ -685,7 +1109,7 @@ export const eventsManager = () => {
         ? events.value.find(event => event.id === previousTopPlayback.eventId)
         : null
       const isPreviousEventStillActive = previousEvent
-        ? isEventTimeInRange(previousEvent, time, presets)
+        ? isEventTimeInRange(previousEvent, time)
         : false
       if (previousTopPlayback && !isPreviousEventStillActive) {
         const { stopDevicePlayback } = devicesManager()
@@ -699,7 +1123,9 @@ export const eventsManager = () => {
     const activeEventChanged = (
       previousTopPlayback?.eventId !== activePlayback.eventId ||
       previousTopPlayback?.triggerId !== activePlayback.triggerId ||
+      previousTopPlayback?.startTime !== activePlayback.startTime ||
       previousTopPlayback?.durationMs !== activePlayback.durationMs ||
+      previousTopPlayback?.singleDurationMs !== activePlayback.singleDurationMs ||
       previousTopPlayback?.totalRepeat !== activePlayback.totalRepeat
     )
 
@@ -719,6 +1145,10 @@ export const eventsManager = () => {
       const { seekDevicePlayback } = devicesManager()
       seekDevicePlayback(Math.min(activePlayback.durationMs, elapsedMs))
     }
+    const { syncDevicePlaybackTime } = devicesManager()
+    syncDevicePlaybackTime(
+      Math.min(activePlayback.durationMs, elapsedMs)
+    )
   }
 
   // 双击事件时按当前视频位置重新同步时间线触发器。
@@ -804,9 +1234,19 @@ export const eventsManager = () => {
     updateEventTime,
     updateEventEndTime,
     addEventPresetTrigger,
+    addEventPresetTriggers,
+    importPresetToEvent,
+    addEventPreset,
+    removeEventPreset,
+    updateEventPresetEffect,
+    updateEventPresetShortcut,
+    moveEventPreset,
     updateEventPresetTriggerTime,
+    updateEventPresetTriggerRange,
     updateEventPresetTriggerTrack,
+    updateEventPresetTriggers,
     removeEventPresetTrigger,
+    removeEventPresetTriggers,
     moveEvent,
     selectEvent,
     triggerEventEffect,

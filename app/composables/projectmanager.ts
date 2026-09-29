@@ -1,6 +1,14 @@
 import { computed } from 'vue'
 import { createDefaultColorCalibration, type RgbColorCalibration } from '~/composables/outputsettingsmanager'
+import {
+  normalizeCurveTemplate,
+  normalizePresetItem,
+  type PresetCurveTemplate,
+  type PresetItem
+} from '~/utils/presetcurve'
 import { videoManager } from '~/composables/videomanager'
+
+export const PROJECT_FORMAT_VERSION = '1.0'
 
 export interface ProjectWindowLayout {
   items: any[]
@@ -19,7 +27,6 @@ export interface ProjectVideoData {
 export interface ProjectSettingsData {
   showSeconds?: boolean
   statusBarBeatIndicator?: boolean
-  disableAnimations?: boolean
   globalBrightness?: number
   colorCalibration?: RgbColorCalibration
   wirelessDelayCompensation?: number
@@ -30,23 +37,19 @@ export interface ProjectSettingsData {
 export interface ProjectWorkspaceData {
   selectedEventId?: number | null
   selectedPresetId?: number | null
-  designViewMode?: 'curve' | 'timeline'
   timelineFollowEnabled?: boolean
   presetCardSize?: number
   timelineZoom?: number
   timelineVerticalZoom?: number
-  activeCurveType?: 'brightness' | 'color'
   historyColors?: string[]
-  curveTemplates?: any[]
+  curveTemplates?: PresetCurveTemplate[]
   settingsCategoryId?: string
-  activeEditTool?: 'pointer' | 'pen' | 'add' | 'delete'
   presetGridScrollTop?: number
   timelineScrollLeft?: number
   timelineTracksScrollTop?: number
 }
 
 export interface ProjectDataPayload {
-  presets?: any[]
   events?: any[]
   windows?: ProjectWindowLayout
   video?: ProjectVideoData
@@ -57,12 +60,18 @@ export interface ProjectDataPayload {
 
 export interface ProjectData {
   format: 'lseproj'
-  version: string
+  version: typeof PROJECT_FORMAT_VERSION
   name: string
   createdAt: string
   updatedAt: string
   data: ProjectDataPayload
 }
+
+const normalizeCurveTemplateList = (templates: unknown[]): PresetCurveTemplate[] => (
+  templates
+    .map((template, index) => normalizeCurveTemplate(template, index))
+    .filter((template): template is PresetCurveTemplate => template !== null)
+)
 
 export const projectManager = () => {
   const currentProject = useState<ProjectData | null>('current_project', () => null)
@@ -73,7 +82,6 @@ export const projectManager = () => {
   }
 
   const collectProjectData = (): ProjectDataPayload => {
-    const presets = useState<any[]>('app_presets_list', () => [])
     const events = useState<any[]>('app_events_list', () => [])
     const windows = useState<any[]>('app_windows', () => [])
     const focusedWindowId = useState<string | null>('focused_window_id', () => null)
@@ -81,16 +89,14 @@ export const projectManager = () => {
     const showSeconds = useState<boolean>('settings_time_show_seconds', () => false)
     const statusBarBeatIndicator = useState<boolean>(
       'settings_status_bar_beat_indicator',
-      () => true
+      () => false
     )
-    const disableAnimations = useState<boolean>('settings_disable_animations', () => false)
     const globalBrightness = useState<number>('output_global_brightness', () => 100)
     const colorCalibration = useState<RgbColorCalibration>('output_color_calibration', createDefaultColorCalibration)
     const wirelessDelayCompensation = useState<number>('output_wireless_delay_compensation', () => 0)
     const compatibilityMode = useState<boolean>('output_compatibility_mode', () => false)
     const selectedEventId = useState<number | null>('app_selected_event_id', () => null)
     const selectedPresetId = useState<number | null>('app_selected_preset_id', () => null)
-    const designViewMode = useState<'curve' | 'timeline'>('app_design_view_mode', () => 'curve')
     const timelineFollowEnabled = useState<boolean>(
       'design_timeline_follow_enabled',
       () => true
@@ -98,17 +104,9 @@ export const projectManager = () => {
     const presetCardSize = useState<number>('presets_card_size', () => 96)
     const timelineZoom = useState<number>('design_timeline_zoom', () => 1)
     const timelineVerticalZoom = useState<number>('design_timeline_vertical_zoom', () => 1)
-    const activeCurveType = useState<'brightness' | 'color'>(
-      'design_active_curve_type',
-      () => 'brightness'
-    )
     const historyColors = useState<string[]>('design_history_colors', () => [])
-    const curveTemplates = useState<any[]>('design_curve_templates', () => [])
+    const curveTemplates = useState<PresetCurveTemplate[]>('design_curve_templates', () => [])
     const settingsCategoryId = useState<string>('settings_current_category', () => 'display')
-    const activeEditTool = useState<'pointer' | 'pen' | 'add' | 'delete'>(
-      'design_active_edit_tool',
-      () => 'pointer'
-    )
     const presetGridScrollTop = useState<number>('presets_grid_scroll_top', () => 0)
     const timelineScrollLeft = useState<number>('design_timeline_scroll_left', () => 0)
     const timelineTracksScrollTop = useState<number>(
@@ -132,17 +130,28 @@ export const projectManager = () => {
     const normalizedEvents = events.value.map(eventItem => {
       const presetTriggers = Array.isArray(eventItem.presetTriggers)
         ? eventItem.presetTriggers
-        : (
-            typeof eventItem.presetId === 'number' && eventItem.presetId > 0
-              ? [{ id: 1, presetId: eventItem.presetId, time: '00:00.00' }]
-              : []
-          )
+        : []
+      const eventPresets = Array.isArray(eventItem.presets)
+        ? eventItem.presets.map((preset: PresetItem, index: number) => {
+            const normalized = normalizePresetItem(preset, index)
+            return {
+              ...normalized,
+              name: `${eventItem.id}-${normalized.id}`
+            }
+          })
+        : []
       return {
         id: eventItem.id,
         name: eventItem.name,
         time: typeof eventItem.time === 'string' ? eventItem.time : '',
         endTime: typeof eventItem.endTime === 'string' ? eventItem.endTime : '',
-        presetTriggers: cloneData(presetTriggers),
+        presets: cloneData(eventPresets),
+        presetTriggers: presetTriggers.map((trigger: any) => ({
+          ...cloneData(trigger),
+          ...(Number.isFinite(trigger?.duration)
+            ? { duration: Math.round(Number(trigger.duration)) }
+            : {})
+        })),
         timelineTrackCount: Math.max(
           0,
           eventItem.timelineTrackCount ?? 0,
@@ -156,8 +165,6 @@ export const projectManager = () => {
     })
 
     return {
-      ...(currentProject.value?.data || {}),
-      presets: cloneData(presets.value),
       events: normalizedEvents,
       windows: {
         items: savedWindows,
@@ -175,7 +182,6 @@ export const projectManager = () => {
         ...(currentProject.value?.data?.settings || {}),
         showSeconds: showSeconds.value,
         statusBarBeatIndicator: statusBarBeatIndicator.value,
-        disableAnimations: disableAnimations.value,
         globalBrightness: globalBrightness.value,
         colorCalibration: cloneData(colorCalibration.value),
         wirelessDelayCompensation: wirelessDelayCompensation.value,
@@ -184,16 +190,13 @@ export const projectManager = () => {
       workspace: {
         selectedEventId: selectedEventId.value,
         selectedPresetId: selectedPresetId.value,
-        designViewMode: designViewMode.value,
         timelineFollowEnabled: timelineFollowEnabled.value,
         presetCardSize: presetCardSize.value,
         timelineZoom: timelineZoom.value,
         timelineVerticalZoom: timelineVerticalZoom.value,
-        activeCurveType: activeCurveType.value,
         historyColors: cloneData(historyColors.value),
-        curveTemplates: cloneData(curveTemplates.value),
+        curveTemplates: normalizeCurveTemplateList(curveTemplates.value),
         settingsCategoryId: settingsCategoryId.value,
-        activeEditTool: activeEditTool.value,
         presetGridScrollTop: presetGridScrollTop.value,
         timelineScrollLeft: timelineScrollLeft.value,
         timelineTracksScrollTop: timelineTracksScrollTop.value
@@ -203,7 +206,6 @@ export const projectManager = () => {
 
   const restoreProjectData = (project: ProjectData) => {
     const data = project.data || {}
-    const presets = useState<any[]>('app_presets_list', () => [])
     const events = useState<any[]>('app_events_list', () => [])
     const windows = useState<any[]>('app_windows', () => [])
     const focusedWindowId = useState<string | null>('focused_window_id', () => null)
@@ -211,16 +213,14 @@ export const projectManager = () => {
     const showSeconds = useState<boolean>('settings_time_show_seconds', () => false)
     const statusBarBeatIndicator = useState<boolean>(
       'settings_status_bar_beat_indicator',
-      () => true
+      () => false
     )
-    const disableAnimations = useState<boolean>('settings_disable_animations', () => false)
     const globalBrightness = useState<number>('output_global_brightness', () => 100)
     const colorCalibration = useState<RgbColorCalibration>('output_color_calibration', createDefaultColorCalibration)
     const wirelessDelayCompensation = useState<number>('output_wireless_delay_compensation', () => 0)
     const compatibilityMode = useState<boolean>('output_compatibility_mode', () => false)
     const selectedEventId = useState<number | null>('app_selected_event_id', () => null)
     const selectedPresetId = useState<number | null>('app_selected_preset_id', () => null)
-    const designViewMode = useState<'curve' | 'timeline'>('app_design_view_mode', () => 'curve')
     const timelineFollowEnabled = useState<boolean>(
       'design_timeline_follow_enabled',
       () => true
@@ -228,17 +228,9 @@ export const projectManager = () => {
     const presetCardSize = useState<number>('presets_card_size', () => 96)
     const timelineZoom = useState<number>('design_timeline_zoom', () => 1)
     const timelineVerticalZoom = useState<number>('design_timeline_vertical_zoom', () => 1)
-    const activeCurveType = useState<'brightness' | 'color'>(
-      'design_active_curve_type',
-      () => 'brightness'
-    )
     const historyColors = useState<string[]>('design_history_colors', () => [])
-    const curveTemplates = useState<any[]>('design_curve_templates', () => [])
+    const curveTemplates = useState<PresetCurveTemplate[]>('design_curve_templates', () => [])
     const settingsCategoryId = useState<string>('settings_current_category', () => 'display')
-    const activeEditTool = useState<'pointer' | 'pen' | 'add' | 'delete'>(
-      'design_active_edit_tool',
-      () => 'pointer'
-    )
     const presetGridScrollTop = useState<number>('presets_grid_scroll_top', () => 0)
     const timelineScrollLeft = useState<number>('design_timeline_scroll_left', () => 0)
     const timelineTracksScrollTop = useState<number>(
@@ -258,11 +250,27 @@ export const projectManager = () => {
       isMuted
     } = videoManager()
 
-    if (Array.isArray(data.presets)) {
-      presets.value = cloneData(data.presets)
-    }
     if (Array.isArray(data.events)) {
-      events.value = cloneData(data.events)
+      events.value = cloneData(data.events).map((eventItem: any, index: number) => {
+        const eventId = typeof eventItem?.id === 'number' ? eventItem.id : index + 1
+        const eventPresets = Array.isArray(eventItem?.presets)
+          ? eventItem.presets.map((preset: PresetItem, presetIndex: number) => {
+              const normalized = normalizePresetItem(preset, presetIndex)
+              return {
+                ...normalized,
+                name: `${eventId}-${normalized.id}`
+              }
+            })
+          : []
+        return {
+          ...eventItem,
+          id: eventId,
+          presets: eventPresets,
+          presetTriggers: Array.isArray(eventItem?.presetTriggers)
+            ? cloneData(eventItem.presetTriggers)
+            : []
+        }
+      })
     }
     if (data.settings) {
       showSeconds.value = typeof data.settings.showSeconds === 'boolean'
@@ -270,9 +278,6 @@ export const projectManager = () => {
         : false
       statusBarBeatIndicator.value = typeof data.settings.statusBarBeatIndicator === 'boolean'
         ? data.settings.statusBarBeatIndicator
-        : true
-      disableAnimations.value = typeof data.settings.disableAnimations === 'boolean'
-        ? data.settings.disableAnimations
         : false
       globalBrightness.value = typeof data.settings.globalBrightness === 'number'
         ? Math.max(0, Math.min(100, Math.round(data.settings.globalBrightness)))
@@ -302,8 +307,7 @@ export const projectManager = () => {
       }
     } else {
       showSeconds.value = false
-      statusBarBeatIndicator.value = true
-      disableAnimations.value = false
+      statusBarBeatIndicator.value = false
       globalBrightness.value = 100
       colorCalibration.value = createDefaultColorCalibration()
       wirelessDelayCompensation.value = 0
@@ -348,28 +352,26 @@ export const projectManager = () => {
     }
 
     const workspace = data.workspace
-    const viewMode = workspace?.designViewMode === 'timeline'
-      ? 'timeline'
-      : 'curve'
-    const savedSelectedPresetId = workspace?.selectedPresetId
-    selectedPresetId.value = (
-      viewMode === 'curve' &&
-      typeof savedSelectedPresetId === 'number' &&
-      presets.value.some(preset => preset.id === savedSelectedPresetId)
-    )
-      ? savedSelectedPresetId
-      : null
-
     const savedSelectedEventId = workspace?.selectedEventId
     selectedEventId.value = (
-      viewMode === 'timeline' &&
       typeof savedSelectedEventId === 'number' &&
       events.value.some(eventItem => eventItem.id === savedSelectedEventId)
     )
       ? savedSelectedEventId
       : null
 
-    designViewMode.value = viewMode
+    const savedSelectedPresetId = workspace?.selectedPresetId
+    const selectedEvent = selectedEventId.value === null
+      ? null
+      : events.value.find(eventItem => eventItem.id === selectedEventId.value) ?? null
+    selectedPresetId.value = (
+      typeof savedSelectedPresetId === 'number' &&
+      Array.isArray(selectedEvent?.presets) &&
+      selectedEvent.presets.some((preset: PresetItem) => preset.id === savedSelectedPresetId)
+    )
+      ? savedSelectedPresetId
+      : null
+
     const savedTimelineFollowEnabled = workspace?.timelineFollowEnabled
     timelineFollowEnabled.value = typeof savedTimelineFollowEnabled === 'boolean'
       ? savedTimelineFollowEnabled
@@ -383,9 +385,6 @@ export const projectManager = () => {
     timelineVerticalZoom.value = Number.isFinite(workspace?.timelineVerticalZoom)
       ? Math.max(0.75, Math.min(2.5, Number(workspace?.timelineVerticalZoom)))
       : 1
-    activeCurveType.value = workspace?.activeCurveType === 'color'
-      ? 'color'
-      : 'brightness'
     const savedHistoryColors = workspace?.historyColors
     historyColors.value = Array.isArray(savedHistoryColors)
       ? savedHistoryColors
@@ -394,7 +393,7 @@ export const projectManager = () => {
       : []
     const savedCurveTemplates = workspace?.curveTemplates
     curveTemplates.value = Array.isArray(savedCurveTemplates)
-      ? cloneData(savedCurveTemplates)
+      ? normalizeCurveTemplateList(savedCurveTemplates)
       : []
 
     const savedSettingsCategoryId = workspace?.settingsCategoryId
@@ -404,16 +403,6 @@ export const projectManager = () => {
     )
       ? savedSettingsCategoryId
       : 'display'
-
-    const savedEditTool = workspace?.activeEditTool
-    activeEditTool.value = (
-      savedEditTool === 'pointer' ||
-      savedEditTool === 'pen' ||
-      savedEditTool === 'add' ||
-      savedEditTool === 'delete'
-    )
-      ? savedEditTool
-      : 'pointer'
 
     presetGridScrollTop.value = Number.isFinite(workspace?.presetGridScrollTop)
       ? Math.max(0, Number(workspace?.presetGridScrollTop))
@@ -462,12 +451,11 @@ export const projectManager = () => {
     const now = new Date().toISOString()
     const newProj: ProjectData = {
       format: 'lseproj',
-      version: '1.0.0',
+      version: PROJECT_FORMAT_VERSION,
       name: cleanName,
       createdAt: now,
       updatedAt: now,
       data: {
-        presets: [],
         events: [],
         settings: {}
       }
@@ -486,7 +474,7 @@ export const projectManager = () => {
     const now = new Date().toISOString()
     const baseProject: ProjectData = currentProject.value ?? {
       format: 'lseproj',
-      version: '1.0.0',
+      version: PROJECT_FORMAT_VERSION,
       name: '未命名临时项目',
       createdAt: now,
       updatedAt: now,
@@ -494,6 +482,7 @@ export const projectManager = () => {
     }
     const savedProject: ProjectData = {
       ...baseProject,
+      version: PROJECT_FORMAT_VERSION,
       updatedAt: now,
       data: collectProjectData()
     }
@@ -513,10 +502,24 @@ export const projectManager = () => {
       throw new Error('无法解析该文件，其内容不是有效的 JSON 格式')
     }
 
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      parsed.format !== 'lseproj' ||
+      !parsed.data ||
+      typeof parsed.data !== 'object'
+    ) {
+      throw new Error('文件不是有效的 LiveStage 工程')
+    }
+
+    if (parsed.version !== PROJECT_FORMAT_VERSION) {
+      throw new Error(`仅支持 ${PROJECT_FORMAT_VERSION} 格式工程`)
+    }
+
     const defaultName = file.name.replace(/\.lseproj$/i, '')
     const proj: ProjectData = {
       format: 'lseproj',
-      version: parsed.version || '1.0.0',
+      version: PROJECT_FORMAT_VERSION,
       name: parsed.name || defaultName || '已加载工程',
       createdAt: parsed.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),

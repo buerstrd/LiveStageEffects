@@ -1,5 +1,3 @@
-import { ref } from 'vue'
-
 export const settingsManager = () => {
   // 是否在状态栏时间中显示秒数
   const showSeconds = useState<boolean>('settings_time_show_seconds', () => false)
@@ -17,7 +15,7 @@ export const settingsManager = () => {
   // 是否使用整条状态栏显示 BPM 节拍提示
   const statusBarBeatIndicator = useState<boolean>(
     'settings_status_bar_beat_indicator',
-    () => true
+    () => false
   )
 
   const toggleStatusBarBeatIndicator = () => {
@@ -28,15 +26,22 @@ export const settingsManager = () => {
     statusBarBeatIndicator.value = val
   }
 
-  // 是否关闭所有界面动画效果
-  const disableAnimations = useState<boolean>('settings_disable_animations', () => false)
+  // 是否在程序启动时清理浏览器缓存
+  const clearBrowserCacheOnStartup = useCookie<boolean>(
+    'lse_clear_browser_cache_on_startup',
+    {
+      default: () => true,
+      sameSite: 'lax',
+      path: '/'
+    }
+  )
 
-  const toggleDisableAnimations = () => {
-    disableAnimations.value = !disableAnimations.value
+  const toggleClearBrowserCacheOnStartup = () => {
+    clearBrowserCacheOnStartup.value = !clearBrowserCacheOnStartup.value
   }
 
-  const setDisableAnimations = (val: boolean) => {
-    disableAnimations.value = val
+  const setClearBrowserCacheOnStartup = (val: boolean) => {
+    clearBrowserCacheOnStartup.value = val
   }
 
   return {
@@ -46,9 +51,9 @@ export const settingsManager = () => {
     statusBarBeatIndicator,
     toggleStatusBarBeatIndicator,
     setStatusBarBeatIndicator,
-    disableAnimations,
-    toggleDisableAnimations,
-    setDisableAnimations
+    clearBrowserCacheOnStartup,
+    toggleClearBrowserCacheOnStartup,
+    setClearBrowserCacheOnStartup
   }
 }
 

@@ -50,6 +50,8 @@ let timeSyncAnchorMediaTime = 0
 let timeSyncAnchorPerformanceTime = 0
 let timeSyncAnchorPlaybackRate = 1
 let didSeekDrag = false
+let seekCaptureTarget: HTMLElement | null = null
+let activeSeekPointerId: number | null = null
 
 const SEEK_DRAG_THRESHOLD = 4
 const SEEK_PRECISION_STEP_PX = 36
@@ -224,12 +226,24 @@ const handleSeekPointerDown = (e: PointerEvent) => {
   pendingSeekTime.value = seekStartTime
 
   const target = e.currentTarget as HTMLElement
+  seekCaptureTarget = target
+  activeSeekPointerId = e.pointerId
   target.setPointerCapture(e.pointerId)
   e.preventDefault()
 }
 
 const handleSeekPointerMove = (e: PointerEvent) => {
   if (!isSeeking.value || duration.value <= 0) return
+  if (
+    activeSeekPointerId !== null &&
+    e.pointerId !== activeSeekPointerId
+  ) {
+    return
+  }
+  if (e.buttons === 0) {
+    finishSeekDrag(e.pointerId)
+    return
+  }
 
   const target = e.currentTarget as HTMLElement
   const rect = target.getBoundingClientRect()
@@ -268,7 +282,10 @@ const handleSeekPointerMove = (e: PointerEvent) => {
   }
 }
 
-const handleSeekPointerUp = (e: PointerEvent) => {
+function finishSeekDrag(
+  pointerId = activeSeekPointerId,
+  commitSeek = true
+) {
   if (!isSeeking.value) return
 
   isSeeking.value = false
@@ -278,12 +295,25 @@ const handleSeekPointerUp = (e: PointerEvent) => {
     seekRafId = null
   }
 
-  const target = e.currentTarget as HTMLElement
-  if (target.hasPointerCapture(e.pointerId)) {
-    target.releasePointerCapture(e.pointerId)
+  const target = seekCaptureTarget
+  if (
+    target &&
+    pointerId !== null &&
+    target.hasPointerCapture(pointerId)
+  ) {
+    target.releasePointerCapture(pointerId)
   }
+  seekCaptureTarget = null
+  activeSeekPointerId = null
 
-  if (!didSeekDrag) return
+  if (!didSeekDrag) {
+    wasPlayingBeforeSeek = false
+    return
+  }
+  if (!commitSeek) {
+    wasPlayingBeforeSeek = false
+    return
+  }
 
   seekVideo(pendingSeekTime.value)
   if (wasPlayingBeforeSeek) {
@@ -292,7 +322,29 @@ const handleSeekPointerUp = (e: PointerEvent) => {
   wasPlayingBeforeSeek = false
 }
 
+const handleSeekPointerUp = (e: PointerEvent) => {
+  finishSeekDrag(e.pointerId)
+}
+
+const handleGlobalSeekPointerUp = (e: PointerEvent) => {
+  if (e.pointerId !== activeSeekPointerId) return
+  finishSeekDrag(e.pointerId)
+}
+
+const handleGlobalSeekPointerCancel = (e: PointerEvent) => {
+  if (e.pointerId !== activeSeekPointerId) return
+  finishSeekDrag(e.pointerId)
+}
+
+const handleGlobalSeekBlur = () => {
+  finishSeekDrag()
+}
+
 onMounted(() => {
+  window.addEventListener('pointerup', handleGlobalSeekPointerUp, true)
+  window.addEventListener('pointercancel', handleGlobalSeekPointerCancel, true)
+  window.addEventListener('blur', handleGlobalSeekBlur)
+
   if (videoRef.value) {
     registerVideoElement(videoRef.value)
     if (videoSrc.value) {
@@ -306,6 +358,10 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('pointerup', handleGlobalSeekPointerUp, true)
+  window.removeEventListener('pointercancel', handleGlobalSeekPointerCancel, true)
+  window.removeEventListener('blur', handleGlobalSeekBlur)
+  finishSeekDrag(undefined, false)
   stopTimeSyncLoop()
   if (seekRafId !== null) {
     cancelAnimationFrame(seekRafId)
@@ -371,6 +427,7 @@ watch(
       @pointermove="handleSeekPointerMove"
       @pointerup="handleSeekPointerUp"
       @pointercancel="handleSeekPointerUp"
+      @lostpointercapture="handleSeekPointerUp"
     >
       <video
         ref="videoRef"

@@ -39,6 +39,12 @@ interface ModelBeatClock {
   generation: number
 }
 
+interface BeatGridReading {
+  observedAt: number
+  bpm: number
+  anchor: number
+}
+
 const REALTIME_SAMPLE_INTERVAL_MS = 25
 const REALTIME_ESTIMATE_INTERVAL_MS = 450
 const REALTIME_SIGNAL_RATE = 50
@@ -49,6 +55,13 @@ const BEAT_MODEL_VALUE_TIMEOUT_MS = 1500
 const MODEL_BPM_MIN_CONFIDENCE = 0.68
 const MODEL_BPM_HISTORY_SIZE = 7
 const MODEL_BPM_SNAP_THRESHOLD = 15
+const BEAT_GRID_STABLE_DURATION_MS = 5000
+const BEAT_GRID_READING_WINDOW_MS = 6500
+const BEAT_GRID_STABLE_SPREAD_BPM = 6
+const BEAT_GRID_MIN_READINGS = 6
+const BEAT_GRID_LARGE_ERROR_RATIO = 0.1
+const BEAT_GRID_LARGE_ERROR_MIN_BPM = 10
+const BEAT_GRID_LARGE_ERROR_COUNT = 3
 const SPECTRUM_BPM_MIN_CONFIDENCE = 0.5
 const MANUAL_BPM_STEP_LIMIT = 2
 const MANUAL_MIN_BPM = 5
@@ -501,6 +514,14 @@ export const useRealtimeBpm = () => {
   const bpm = useState<number | null>('realtime_bpm_value', () => null)
   const status = useState<RealtimeBpmStatus>('realtime_bpm_status', () => 'idle')
   const source = useState<RealtimeBpmSource>('realtime_bpm_source', () => null)
+  const beatGridPeriod = useState<number | null>(
+    'realtime_bpm_beat_grid_period',
+    () => null
+  )
+  const beatGridAnchor = useState<number | null>(
+    'realtime_bpm_beat_grid_anchor',
+    () => null
+  )
   const modelStatus = useState<RealtimeBeatModelStatus>(
     'realtime_bpm_model_status',
     () => 'idle'
@@ -529,6 +550,10 @@ export const useRealtimeBpm = () => {
   )
   const manualBpmStep = useState<number>(
     'realtime_bpm_manual_step',
+    () => 0
+  )
+  const beatGridResetToken = useState<number>(
+    'realtime_bpm_beat_grid_reset_token',
     () => 0
   )
   const manualBpmResetAvailable = computed(() => {
@@ -613,10 +638,16 @@ export const useRealtimeBpm = () => {
     manualBpmCommand.value = null
   }
 
+  const resetBeatGridAnalysis = () => {
+    beatGridResetToken.value += 1
+  }
+
   return {
     bpm,
     status,
     source,
+    beatGridPeriod,
+    beatGridAnchor,
     modelStatus,
     modelError,
     modelHops,
@@ -631,7 +662,9 @@ export const useRealtimeBpm = () => {
     manualBpmResetAvailable,
     applyManualBpmFactor,
     resetManualBpm,
-    clearManualBpmCalibration
+    clearManualBpmCalibration,
+    beatGridResetToken,
+    resetBeatGridAnalysis
   }
 }
 
@@ -646,6 +679,8 @@ export const bpmAnalyzer = () => {
     bpm,
     status,
     source,
+    beatGridPeriod,
+    beatGridAnchor,
     modelStatus,
     modelError,
     modelHops,
@@ -655,7 +690,8 @@ export const bpmAnalyzer = () => {
     musicDetected,
     beatPulse,
     manualBpmCommand,
-    clearManualBpmCalibration
+    clearManualBpmCalibration,
+    beatGridResetToken
   } = useRealtimeBpm()
 
   let monitorTimer: ReturnType<typeof setInterval> | null = null
@@ -671,6 +707,10 @@ export const bpmAnalyzer = () => {
   let modelBpmHistory: number[] = []
   let modelBeatClock: ModelBeatClock | null = null
   let modelBeatRafId: number | null = null
+  let beatGridReadings: BeatGridReading[] = []
+  let beatGridLockedBpm: number | null = null
+  let beatGridLargeErrorCount = 0
+  let beatGridReadingSource: 'model' | 'spectrum' | null = null
   let manualBpmOverrideUntil = 0
   const octaveLock = createBpmOctaveLock({
     minBpm: MANUAL_MIN_BPM,
@@ -706,6 +746,164 @@ export const bpmAnalyzer = () => {
       return contextTime
     }
     return audioContext.currentTime
+  }
+
+  const getVideoPlaybackRate = () => {
+    const video = getVideoElement()
+    const playbackRate = video?.playbackRate
+    return typeof playbackRate === 'number' && Number.isFinite(playbackRate)
+      ? Math.max(0.01, playbackRate)
+      : 1
+  }
+
+  const mapAudioTimeToMediaTime = (audioTime: number) => {
+    const video = getVideoElement()
+    if (
+      !audioContext
+      || !video
+      || !Number.isFinite(audioTime)
+      || !Number.isFinite(video.currentTime)
+    ) {
+      return null
+    }
+
+    return video.currentTime
+      - (getAudioPlayheadTime() - audioTime) * getVideoPlaybackRate()
+  }
+
+  const setBeatGrid = (anchor: number | null, period: number) => {
+    if (
+      anchor === null
+      || !Number.isFinite(anchor)
+      || !Number.isFinite(period)
+      || period <= 0
+    ) {
+      return
+    }
+
+    beatGridAnchor.value = anchor
+    beatGridPeriod.value = period
+  }
+
+  const clearBeatGrid = (force = true) => {
+    if (!force && beatGridLockedBpm !== null) {
+      return
+    }
+
+    beatGridAnchor.value = null
+    beatGridPeriod.value = null
+    beatGridReadings = []
+    beatGridLockedBpm = null
+    beatGridLargeErrorCount = 0
+    beatGridReadingSource = null
+  }
+
+  const averageBeatAnchor = (
+    readings: BeatGridReading[],
+    period: number
+  ) => {
+    const referenceAnchor = readings[readings.length - 1]?.anchor
+    if (referenceAnchor === undefined || !Number.isFinite(referenceAnchor)) {
+      return null
+    }
+
+    let anchorSum = 0
+    for (const reading of readings) {
+      const beatOffset = Math.round(
+        (reading.anchor - referenceAnchor) / period
+      )
+      anchorSum += reading.anchor - beatOffset * period
+    }
+
+    const averagedAnchor = anchorSum / readings.length
+    return Number.isFinite(averagedAnchor) ? averagedAnchor : null
+  }
+
+  const registerBeatGridReading = (
+    reading: BeatGridReading,
+    readingSource: 'model' | 'spectrum'
+  ) => {
+    if (
+      !Number.isFinite(reading.observedAt)
+      || !Number.isFinite(reading.bpm)
+      || reading.bpm <= 0
+      || !Number.isFinite(reading.anchor)
+    ) {
+      return
+    }
+
+    if (beatGridLockedBpm !== null) {
+      const bpmError = Math.abs(reading.bpm - beatGridLockedBpm)
+      const largeError = bpmError >= BEAT_GRID_LARGE_ERROR_MIN_BPM
+        && bpmError / beatGridLockedBpm >= BEAT_GRID_LARGE_ERROR_RATIO
+
+      if (!largeError) {
+        beatGridLargeErrorCount = 0
+        return
+      }
+
+      beatGridLargeErrorCount += 1
+      if (beatGridLargeErrorCount < BEAT_GRID_LARGE_ERROR_COUNT) {
+        return
+      }
+
+      clearBeatGrid()
+      beatGridReadings.push(reading)
+      beatGridReadingSource = readingSource
+      return
+    }
+
+    if (beatGridReadingSource !== readingSource) {
+      beatGridReadings = []
+      beatGridReadingSource = readingSource
+    }
+
+    beatGridReadings.push(reading)
+    const oldestAllowedTime = reading.observedAt - BEAT_GRID_READING_WINDOW_MS
+    const firstValidIndex = beatGridReadings.findIndex(
+      item => item.observedAt >= oldestAllowedTime
+    )
+    if (firstValidIndex > 0) {
+      beatGridReadings.splice(0, firstValidIndex)
+    }
+
+    const firstReading = beatGridReadings[0]
+    if (
+      !firstReading
+      || beatGridReadings.length < BEAT_GRID_MIN_READINGS
+      || reading.observedAt - firstReading.observedAt
+        < BEAT_GRID_STABLE_DURATION_MS
+    ) {
+      return
+    }
+
+    let minBpm = Number.POSITIVE_INFINITY
+    let maxBpm = 0
+    let bpmSum = 0
+    for (const item of beatGridReadings) {
+      minBpm = Math.min(minBpm, item.bpm)
+      maxBpm = Math.max(maxBpm, item.bpm)
+      bpmSum += item.bpm
+    }
+
+    if (maxBpm - minBpm > BEAT_GRID_STABLE_SPREAD_BPM) {
+      return
+    }
+
+    const averagedBpm = bpmSum / beatGridReadings.length
+    const averagedPeriod = 60 / averagedBpm
+    const averagedAnchor = averageBeatAnchor(
+      beatGridReadings,
+      averagedPeriod
+    )
+    if (averagedAnchor === null) {
+      return
+    }
+
+    setBeatGrid(averagedAnchor, averagedPeriod)
+    beatGridLockedBpm = averagedBpm
+    beatGridLargeErrorCount = 0
+    beatGridReadings = []
   }
 
   const mapAudioTimeToPerformanceTime = (audioTime: number) => {
@@ -820,6 +1018,17 @@ export const bpmAnalyzer = () => {
       }
     }
 
+    const mediaAnchor = mapAudioTimeToMediaTime(message.audioTime)
+    if (mediaAnchor !== null) {
+      registerBeatGridReading(
+        {
+          observedAt: performance.now(),
+          bpm: bpm.value ?? message.bpm,
+          anchor: mediaAnchor
+        },
+        'model'
+      )
+    }
     ensureModelBeatScheduler()
   }
 
@@ -840,6 +1049,17 @@ export const bpmAnalyzer = () => {
       lastPulseIndex: -1,
       generation: beatGeneration
     }
+    const video = getVideoElement()
+    setBeatGrid(
+      video && Number.isFinite(video.currentTime)
+        ? video.currentTime
+        : null,
+      modelBeatClock.period
+    )
+    beatGridReadings = []
+    beatGridLockedBpm = manualBpm
+    beatGridLargeErrorCount = 0
+    beatGridReadingSource = null
     ensureModelBeatScheduler()
   }
 
@@ -853,6 +1073,7 @@ export const bpmAnalyzer = () => {
       modelHops.value = 0
       modelBeats.value = 0
       modelSilent.value = false
+      clearBeatGrid(false)
       modelBpmHistory = []
       musicScore.value = 0
       musicDetected.value = null
@@ -941,10 +1162,13 @@ export const bpmAnalyzer = () => {
         // Hold the last stable model reading while confidence recovers.
         lastBeatModelValueAt = performance.now()
       } else if (!manualOverrideActive && !musicAllowsOutput) {
-        bpm.value = null
-        source.value = null
+        if (beatGridLockedBpm === null) {
+          bpm.value = null
+          source.value = null
+        }
         lastBeatModelValueAt = 0
         modelBpmHistory = []
+        clearBeatGrid(false)
         stopModelBeatScheduler(true)
       }
       if (typeof message.hops === 'number') {
@@ -990,6 +1214,7 @@ export const bpmAnalyzer = () => {
       musicScore.value = 0
       musicDetected.value = null
       source.value = null
+      clearBeatGrid(false)
       status.value = videoSrc.value ? 'waiting' : 'idle'
     }
   }
@@ -998,7 +1223,8 @@ export const bpmAnalyzer = () => {
 
   const resetSignal = (
     clearValue: boolean,
-    resetOctaveLock = true
+    resetOctaveLock = true,
+    preserveBeatGrid = false
   ) => {
     stopModelBeatScheduler(true)
     history = []
@@ -1013,6 +1239,9 @@ export const bpmAnalyzer = () => {
     modelHops.value = 0
     modelBeats.value = 0
     modelSilent.value = false
+    if (!preserveBeatGrid) {
+      clearBeatGrid()
+    }
     modelBpmHistory = []
     if (resetOctaveLock) {
       octaveLock.reset()
@@ -1023,7 +1252,7 @@ export const bpmAnalyzer = () => {
     musicScore.value = 0
     musicDetected.value = null
     previousFrequencyData?.fill(0)
-    if (clearValue) {
+    if (clearValue && !preserveBeatGrid) {
       bpm.value = null
       source.value = null
     }
@@ -1083,6 +1312,21 @@ export const bpmAnalyzer = () => {
       }
     }
     beatPeriodSeconds = nextBeatPeriod
+    const video = getVideoElement()
+    const playbackRate = getVideoPlaybackRate()
+    const mediaAnchor = video && Number.isFinite(video.currentTime)
+      ? video.currentTime - (now / 1000 - estimate.referenceTime) * playbackRate
+      : null
+    if (mediaAnchor !== null) {
+      registerBeatGridReading(
+        {
+          observedAt: now,
+          bpm: bpm.value ?? estimate.bpm,
+          anchor: mediaAnchor
+        },
+        'spectrum'
+      )
+    }
     lastPublishedTime = now
     modelBpmHistory = []
     stopModelBeatScheduler(true)
@@ -1126,6 +1370,20 @@ export const bpmAnalyzer = () => {
     }
   )
 
+  watch(
+    () => beatGridResetToken.value,
+    () => {
+      clearManualBpmCalibration()
+      resetSignal(true)
+      resetBeatWorker()
+      status.value = !videoSrc.value
+        ? 'idle'
+        : isVideoPlaying.value
+          ? 'waiting'
+          : 'paused'
+    }
+  )
+
   const monitor = () => {
     const video = getVideoElement()
     if (!video || !videoSrc.value) {
@@ -1164,9 +1422,12 @@ export const bpmAnalyzer = () => {
       )
 
     if (musicGateBlocked) {
-      bpm.value = null
-      source.value = null
+      if (beatGridLockedBpm === null) {
+        bpm.value = null
+        source.value = null
+      }
       lastBeatModelValueAt = 0
+      clearBeatGrid(false)
       stopModelBeatScheduler(true)
       status.value = musicDetected.value === false
         ? 'non-music'
@@ -1260,9 +1521,12 @@ export const bpmAnalyzer = () => {
         lastPublishedTime > 0 &&
         now - lastPublishedTime > REALTIME_VALUE_TIMEOUT_MS
       ) {
-        bpm.value = null
-        source.value = null
+        if (beatGridLockedBpm === null) {
+          bpm.value = null
+          source.value = null
+        }
         stopModelBeatScheduler(true)
+        clearBeatGrid(false)
         estimates = []
         nextBeatTimeSeconds = 0
         beatPeriodSeconds = 0
@@ -1345,8 +1609,11 @@ export const bpmAnalyzer = () => {
   watch(
     () => seekVersion.value,
     () => {
-      resetSignal(true, false)
-      resetBeatWorker()
+      const preserveLockedBeatGrid = beatGridLockedBpm !== null
+      resetSignal(true, false, preserveLockedBeatGrid)
+      if (!preserveLockedBeatGrid) {
+        resetBeatWorker()
+      }
       status.value = isVideoPlaying.value ? 'waiting' : 'paused'
     }
   )
@@ -1381,6 +1648,8 @@ export const bpmAnalyzer = () => {
 
   return {
     bpm,
-    status
+    status,
+    beatGridPeriod,
+    beatGridAnchor
   }
 }

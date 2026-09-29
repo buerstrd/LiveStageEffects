@@ -30,7 +30,7 @@ export const statusBarNoticeManager = () => {
   const showStatusBarNotice = (
     buttonId: string,
     message: string,
-    duration = DEFAULT_NOTICE_DURATION_MS,
+    duration: number | null = DEFAULT_NOTICE_DURATION_MS,
     style: StatusBarNoticeStyle = {}
   ) => {
     const normalizedButtonId = buttonId.trim()
@@ -55,6 +55,11 @@ export const statusBarNoticeManager = () => {
     if (previousTimer) {
       clearTimeout(previousTimer)
     }
+    if (duration === null) {
+      noticeTimers.delete(normalizedButtonId)
+      return
+    }
+
     noticeTimers.set(normalizedButtonId, setTimeout(() => {
       const currentNotice = activeNotices.value[normalizedButtonId]
       if (currentNotice?.token !== token) return

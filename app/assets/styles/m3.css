@@ -94,16 +94,6 @@ body.no-grid {
   animation-duration: 0.001ms !important;
 }
 
-/* 开发设置：关闭所有界面动画效果 */
-.animations-disabled,
-.animations-disabled *,
-.animations-disabled *::before,
-.animations-disabled *::after {
-  animation: none !important;
-  transition: none !important;
-  scroll-behavior: auto !important;
-}
-
 /* 统一所有控件、输入框与代码元素全局采用 Google Sans */
 button,
 [role="button"],
@@ -145,4 +135,31 @@ button,
     transform: scale(2.5);
     opacity: 0;
   }
+}
+
+/* Material Design 3 全局按钮提示 */
+.md3-tooltip {
+  position: fixed;
+  z-index: 2147483647;
+  max-width: min(360px, calc(100vw - 16px));
+  padding: 6px 10px;
+  overflow: hidden;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-sys-shape-corner-extra-small);
+  background: var(--md-sys-color-surface-container-highest);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.38);
+  color: var(--md-sys-color-on-surface);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.md3-tooltip.is-positioned {
+  opacity: 1;
 }
